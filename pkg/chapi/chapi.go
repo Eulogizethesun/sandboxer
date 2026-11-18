@@ -10,6 +10,7 @@ package chapi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -32,7 +33,16 @@ const (
 	waitReadyInitialPoll = 1 * time.Millisecond
 	waitReadyMaxPoll     = 20 * time.Millisecond
 	maxReadyResponseBody = 1 << 20
+
+	// maxBodyResponseBytes bounds the read-until-EOF response variant used by
+	// management calls that return a JSON body. It must be well above the
+	// legacy 4 KiB single-read buffer because callers need the whole body.
+	maxBodyResponseBytes = 1 << 20
 )
+
+// vsockResetPath is the CH API endpoint that publishes a vsock
+// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET before the snapshot is taken.
+const vsockResetPath = "/api/v1/vm.vsock-reset"
 
 // Client issues management calls against one CH api-socket. The zero value is
 // usable except for Sock. RespDeadline bounds the response read; 0 = no forced
@@ -42,6 +52,17 @@ const (
 type Client struct {
 	Sock         string
 	RespDeadline time.Duration
+}
+
+// VsockResetResult reports the outcome of one vsock transport-reset request.
+// Published=false means CH did not publish a reset (for example the device is
+// absent or inactive); the caller must let the snapshot keep CH's legacy
+// staging path. Published=true with Acked=false means the reset was published
+// but the guest did not acknowledge it before timeout; the snapshot then keeps
+// transport_reset_pending=true and restore gates on the guest ACK.
+type VsockResetResult struct {
+	Published bool
+	Acked     bool
 }
 
 // Pause issues PUT /api/v1/vm.pause.
@@ -69,36 +90,103 @@ func (c Client) Snapshot(destURL string) error {
 // reaper path. The 2xx is the ACK; the actual exit is awaited by the caller.
 func (c Client) ShutdownVMM() error { return c.do("PUT", "/api/v1/vmm.shutdown", "") }
 
+// VsockReset issues PUT /api/v1/vm.vsock-reset with {"timeout_ms":N}. CH
+// publishes a transport reset to the running guest and waits up to timeout for
+// the guest to acknowledge it. It returns the published/acked pair decoded
+// from the response JSON; a non-200 response (or an unparsable body) is an
+// error carrying CH's body text.
+//
+// The caller's RespDeadline still bounds the whole call, so it must exceed the
+// timeout handed to CH (the design assumes ch_api deadline > reset timeout).
+func (c Client) VsockReset(ctx context.Context, timeout time.Duration) (VsockResetResult, error) {
+	timeoutMs := timeout.Milliseconds()
+	if timeoutMs < 0 {
+		timeoutMs = 0
+	}
+	body := fmt.Sprintf(`{"timeout_ms":%d}`, timeoutMs)
+	status, respBody, err := c.doBodyContext(ctx, "PUT", vsockResetPath, body)
+	if err != nil {
+		return VsockResetResult{}, err
+	}
+	if status != http.StatusOK {
+		return VsockResetResult{}, fmt.Errorf("ch api PUT %s non-200 (%d): %s", vsockResetPath, status, strings.TrimSpace(string(respBody)))
+	}
+	var decoded struct {
+		Published bool `json:"published"`
+		Acked     bool `json:"acked"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(respBody))
+	if err := dec.Decode(&decoded); err != nil {
+		return VsockResetResult{}, fmt.Errorf("ch api PUT %s response JSON: %w", vsockResetPath, err)
+	}
+	if err := requireJSONEOF(dec); err != nil {
+		return VsockResetResult{}, fmt.Errorf("ch api PUT %s response JSON: %w", vsockResetPath, err)
+	}
+	return VsockResetResult{Published: decoded.Published, Acked: decoded.Acked}, nil
+}
+
 func (c Client) do(method, path, body string) error {
 	return c.doContext(context.Background(), method, path, body)
+}
+
+// doBodyContext is the read-until-EOF counterpart of doContext for calls whose
+// response body carries data. The existing doContext intentionally reads one
+// 4 KiB chunk because its callers only need the status digit; management
+// bodies must not be truncated. It returns the HTTP status and the complete
+// body (chunked or Content-Length framed; Connection: close already set).
+func (c Client) doBodyContext(ctx context.Context, method, path, body string) (int, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, stopCancel, err := c.dial(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer conn.Close()
+	defer stopCancel()
+
+	if err := writeRequest(conn, method, path, body); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, nil, fmt.Errorf("ch api %s %s write: %w", method, path, ctxErr)
+		}
+		return 0, nil, fmt.Errorf("ch api %s %s write: %w", method, path, err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: method})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, nil, fmt.Errorf("ch api %s %s read: %w", method, path, ctxErr)
+		}
+		return 0, nil, fmt.Errorf("ch api %s %s response: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyResponseBytes+1))
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, nil, fmt.Errorf("ch api %s %s read: %w", method, path, ctxErr)
+		}
+		return 0, nil, fmt.Errorf("ch api %s %s body: %w", method, path, err)
+	}
+	if len(respBody) > maxBodyResponseBytes {
+		return 0, nil, fmt.Errorf("ch api %s %s response exceeds %d bytes", method, path, maxBodyResponseBytes)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return 0, nil, fmt.Errorf("ch api %s %s read: %w", method, path, ctxErr)
+	}
+	return resp.StatusCode, respBody, nil
 }
 
 func (c Client) doContext(ctx context.Context, method, path, body string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", c.Sock)
-	cancelDial()
+	conn, stopCancel, err := c.dial(ctx)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("ch api dial %s: %w", c.Sock, ctxErr)
-		}
-		return fmt.Errorf("ch api dial %s: %w", c.Sock, err)
+		return err
 	}
 	defer conn.Close()
-	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopCancel()
-	if c.RespDeadline > 0 {
-		_ = conn.SetDeadline(time.Now().Add(c.RespDeadline))
-	}
 
-	req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: ch\r\n", method, path)
-	if body != "" {
-		req += fmt.Sprintf("Content-Type: application/json\r\nContent-Length: %d\r\n", len(body))
-	}
-	req += "Connection: close\r\n\r\n" + body
-	if _, err := conn.Write([]byte(req)); err != nil {
+	if err := writeRequest(conn, method, path, body); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("ch api %s %s write: %w", method, path, ctxErr)
 		}
@@ -120,6 +208,39 @@ func (c Client) doContext(ctx context.Context, method, path, body string) error 
 		return fmt.Errorf("ch api %s %s non-2xx: %q", method, path, resp)
 	}
 	return nil
+}
+
+// dial opens the api-socket and installs the response deadline/cancellation.
+// The returned stop function releases the cancellation callback; callers must
+// also close the connection.
+func (c Client) dial(ctx context.Context) (net.Conn, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", c.Sock)
+	cancelDial()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, fmt.Errorf("ch api dial %s: %w", c.Sock, ctxErr)
+		}
+		return nil, nil, fmt.Errorf("ch api dial %s: %w", c.Sock, err)
+	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	if c.RespDeadline > 0 {
+		_ = conn.SetDeadline(time.Now().Add(c.RespDeadline))
+	}
+	return conn, func() { stopCancel() }, nil
+}
+
+func writeRequest(w io.Writer, method, path, body string) error {
+	req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: ch\r\n", method, path)
+	if body != "" {
+		req += fmt.Sprintf("Content-Type: application/json\r\nContent-Length: %d\r\n", len(body))
+	}
+	req += "Connection: close\r\n\r\n" + body
+	_, err := io.WriteString(w, req)
+	return err
 }
 
 // WaitReady polls vm.info until CH reports the restored VM in Paused state.

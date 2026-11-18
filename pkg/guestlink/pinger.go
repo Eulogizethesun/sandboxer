@@ -394,10 +394,15 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	pm := perfmark.Start("guestlink", "restore")
+	pm := perfmark.Start("guestlink", "restore").SID(client.SID)
 	tDial := time.Now()
-	conn, err := dialRawForRestoreContext(ctx, client, deadline, restoreDialAttemptTimeout)
+	conn, dialStats, err := dialRawForRestoreContext(ctx, client, deadline, restoreDialAttemptTimeout, pm)
 	pm.Dur("restore.dial", tDial)
+	dialKV := map[string]any{"attempts": dialStats.Attempts, "retries": dialStats.Retries}
+	if err != nil && dialStats.FirstErr != nil {
+		dialKV["first_err"] = dialStats.FirstErr.Error()
+	}
+	pm.MarkKV("restore.dial_attempts", dialKV)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
@@ -452,24 +457,35 @@ const (
 // restore deadline or context cancellation. A successful CONNECT/OK restores
 // the overall deadline before the request is written.
 func dialRawForRestore(client *HostClient, deadline, attemptTimeout time.Duration) (net.Conn, error) {
-	return dialRawPreRequestContext(context.Background(), client, deadline, attemptTimeout, "restore")
+	conn, _, err := dialRawPreRequestContext(context.Background(), client, deadline, attemptTimeout, "restore", nil)
+	return conn, err
 }
 
-func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline, attemptTimeout time.Duration) (net.Conn, error) {
-	return dialRawPreRequestContext(ctx, client, deadline, attemptTimeout, "restore")
+func dialRawForRestoreContext(ctx context.Context, client *HostClient, deadline, attemptTimeout time.Duration, pm *perfmark.Marks) (net.Conn, dialAttemptStats, error) {
+	return dialRawPreRequestContext(ctx, client, deadline, attemptTimeout, "restore", pm)
 }
 
-func dialRawPreRequestContext(ctx context.Context, client *HostClient, deadline, attemptTimeout time.Duration, operation string) (net.Conn, error) {
+// dialAttemptStats feeds the restore.dial_attempts mark. Attempts counts every
+// CONNECT/OK attempt; Retries is Attempts-1. FirstErr records the first
+// attempt's error, which is the useful cause when a later retry also fails.
+type dialAttemptStats struct {
+	Attempts int
+	Retries  int
+	FirstErr error
+}
+
+func dialRawPreRequestContext(ctx context.Context, client *HostClient, deadline, attemptTimeout time.Duration, operation string, pm *perfmark.Marks) (net.Conn, dialAttemptStats, error) {
 	deadlineAt := time.Now().Add(deadline)
 	if attemptTimeout <= 0 {
 		attemptTimeout = deadline
 	}
 
+	var stats dialAttemptStats
 	backoff := restoreDialRetryInitial
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 		attemptDeadline := time.Now().Add(attemptTimeout)
 		if deadlineAt.Before(attemptDeadline) {
@@ -478,32 +494,42 @@ func dialRawPreRequestContext(ctx context.Context, client *HostClient, deadline,
 		remaining := time.Until(attemptDeadline)
 		if remaining <= 0 {
 			if lastErr != nil {
-				return nil, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt-1, lastErr)
+				return nil, stats, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt-1, lastErr)
 			}
-			return nil, fmt.Errorf("%s pre-request connect: deadline exceeded after %d attempts", operation, attempt-1)
+			return nil, stats, fmt.Errorf("%s pre-request connect: deadline exceeded after %d attempts", operation, attempt-1)
 		}
 
+		stats.Attempts = attempt
+		stats.Retries = attempt - 1
+		attemptStart := time.Now()
 		conn, err := client.DialRawContext(ctx, remaining)
+		if attempt == 1 {
+			// Dur of the first attempt only; retries inflate restore.dial.
+			pm.Dur("restore.dial.first_try", attemptStart)
+		}
 		if err == nil {
 			// Each CONNECT/OK attempt has its own bound. Restore
 			// write+ACK still owns the original overall restore deadline.
 			if err := conn.SetDeadline(deadlineAt); err != nil {
 				_ = conn.Close()
-				return nil, fmt.Errorf("%s pre-request connect: overall deadline: %w", operation, err)
+				return nil, stats, fmt.Errorf("%s pre-request connect: overall deadline: %w", operation, err)
 			}
 			if attempt > 1 && client.Logf != nil {
 				client.Logf("%s pre-request connect recovered on attempt %d", operation, attempt)
 			}
-			return conn, nil
+			return conn, stats, nil
+		}
+		if attempt == 1 {
+			stats.FirstErr = err
 		}
 		if !retryableRestoreDialError(err) {
-			return nil, err
+			return nil, stats, err
 		}
 		lastErr = err
 
 		retryRemaining := time.Until(deadlineAt)
 		if retryRemaining <= backoff {
-			return nil, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt, err)
+			return nil, stats, fmt.Errorf("%s pre-request connect failed after %d attempts: %w", operation, attempt, err)
 		}
 		if client.Logf != nil {
 			client.Logf("%s pre-request connect attempt %d failed: %v; retrying in %s", operation, attempt, err, backoff)
@@ -518,7 +544,7 @@ func dialRawPreRequestContext(ctx context.Context, client *HostClient, deadline,
 				default:
 				}
 			}
-			return nil, ctx.Err()
+			return nil, stats, ctx.Err()
 		}
 		backoff *= 2
 		if backoff > restoreDialRetryMax {
@@ -552,7 +578,7 @@ func OpenMUXViaAttachContext(ctx context.Context, client *HostClient, epoch uint
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn, err := dialRawPreRequestContext(ctx, client, deadline, restoreDialAttemptTimeout, "attach")
+	conn, _, err := dialRawPreRequestContext(ctx, client, deadline, restoreDialAttemptTimeout, "attach", nil)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}

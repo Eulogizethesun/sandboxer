@@ -1,0 +1,1528 @@
+From 79fcdbb8ea38a771afa4a064660e2e3dd92a3e09 Mon Sep 17 00:00:00 2001
+From: Kuasar Sandbox <noreply@kuasar.dev>
+Date: Wed, 18 Nov 2026 11:05:00 +0800
+Subject: [PATCH 15/15] virtio-devices: publish vsock transport reset before freeze
+
+Restoring a vsock device waits for the guest to acknowledge the
+TRANSPORT_RESET event staged while the VM was paused for the snapshot, so the
+restore dial pays the guest's whole reset processing time (60-70 ms) before
+the first connection can be established.
+
+Publish the reset while the VM is still running instead, after the host has
+quiesced the guest and before /vm.pause. The vsock worker owns the live event
+queue, memory and queue eventfds, so the VMM thread only writes a command
+eventfd and polls shared atomics. The worker drains stale kicks, pops an event
+descriptor, writes VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, adds it to the used
+ring, sets transport_reset_pending and signals the queue.
+
+The guest acknowledges by advancing the event queue avail index and kicking,
+so a stale kick alone cannot acknowledge the reset. snapshot() skips staging
+when a reset was already published and serializes the current pending state:
+a timed out reset still produces a gated snapshot that the existing restore
+path understands. Nothing new is serialized: reset_published is runtime only
+and is cleared by activate/resume/reset.
+
+The worker and the snapshot path share one event queue instance so their
+next_avail/next_used bookkeeping cannot diverge after a running reset followed
+by a source resume and another snapshot.
+
+Expose the capability as PUT /api/v1/vm.vsock-reset with an optional
+{"timeout_ms": N} body, returning {"published": bool, "acked": bool}. The
+request is idempotent and never publishes twice, and a missing or inactive
+device reports published=false.
+
+Add KUASAR_TEST_HOOKS=1 failure injection (delay-ack, drop-ack, no-desc,
+fail-after-publish, stale-kick) for the negative tests. Release binaries
+ignore the hooks unless built with the `kuasar-test-hooks` feature.
+---
+ virtio-devices/Cargo.toml          |   3 +
+ virtio-devices/src/device.rs       | 127 ++++++-
+ virtio-devices/src/lib.rs          |   4 +-
+ virtio-devices/src/vsock/device.rs | 742 ++++++++++++++++++++++++++++++++++++-
+ virtio-devices/src/vsock/mod.rs    |  36 +-
+ vmm/src/api/http/http_endpoint.rs  |  23 ++
+ vmm/src/api/http/mod.rs            |   6 +-
+ vmm/src/api/mod.rs                 |  56 +++
+ vmm/src/device_manager.rs          |  12 +
+ vmm/src/lib.rs                     |  27 +-
+ vmm/src/vm.rs                      |  27 ++
+ 11 files changed, 1036 insertions(+), 27 deletions(-)
+
+diff --git a/virtio-devices/Cargo.toml b/virtio-devices/Cargo.toml
+index 5cbfe14..0136d5c 100644
+--- a/virtio-devices/Cargo.toml
++++ b/virtio-devices/Cargo.toml
+@@ -9,6 +9,9 @@ default = []
+ kvm = ["pci/kvm"]
+ mshv = ["pci/mshv"]
+ sev_snp = ["mshv-ioctls"]
++# Enables the KUASAR vsock transport reset failure-injection hooks in release
++# builds. Release builds without this feature ignore them entirely.
++kuasar-test-hooks = []
+ 
+ [dependencies]
+ anyhow = { workspace = true }
+diff --git a/virtio-devices/src/device.rs b/virtio-devices/src/device.rs
+index 07b485b..a5537d6 100644
+--- a/virtio-devices/src/device.rs
++++ b/virtio-devices/src/device.rs
+@@ -9,9 +9,10 @@
+ use std::collections::HashMap;
+ use std::io::{ErrorKind, Write};
+ use std::num::Wrapping;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::sync::{Arc, Barrier};
+ use std::thread;
++use std::time::{Duration, Instant};
+ 
+ use libc::EFD_NONBLOCK;
+ use log::{error, info, warn};
+@@ -39,6 +40,123 @@ pub trait VirtioInterrupt: Send + Sync {
+     }
+ }
+ 
++/// Result of a device transport reset published by the host.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct TransportResetResult {
++    /// A transport reset event was published to the guest.
++    pub published: bool,
++    /// The guest consumed the event and refilled the event queue.
++    pub acked: bool,
++}
++
++/// State shared between the device (VMM thread) and its worker thread for a
++/// transport reset published while the VM is running.
++///
++/// None of this is serialized: it only describes a reset that was asked for in
++/// the current activation, exactly like `reset_published`.
++#[derive(Default)]
++pub struct TransportResetShared {
++    /// A command was written and the worker has not processed it yet.
++    pub(crate) outstanding: AtomicBool,
++    /// The worker finished processing the current command.
++    pub(crate) completed: AtomicBool,
++    /// Result of the current command, as reported to the API caller.
++    pub(crate) published: AtomicBool,
++    /// The guest acknowledged the published reset.
++    pub(crate) acked: AtomicBool,
++    /// Guest event queue avail index observed right before publishing. The
++    /// guest acknowledges by advancing it, so a kick alone is not enough.
++    pub(crate) expected_avail: AtomicU32,
++    /// A kick with an advanced avail index was observed but the test
++    /// `delay-ack` hook asked to defer the acknowledgement.
++    pub(crate) ack_ready: AtomicBool,
++    /// The test `delay-ack` hook already deferred one acknowledgement.
++    pub(crate) ack_deferred: AtomicBool,
++}
++
++impl TransportResetShared {
++    pub fn new() -> Arc<Self> {
++        Arc::new(Self::default())
++    }
++}
++
++/// Handle returned by [`VirtioDevice::reset_transport`].
++///
++/// It only carries shared atomic state so the caller can release the device
++/// lock before waiting for the guest acknowledgement.
++pub struct TransportResetHandle {
++    shared: Arc<TransportResetShared>,
++    started: Instant,
++}
++
++impl TransportResetHandle {
++    /// Handle for a device that did not publish anything.
++    pub fn not_published() -> Self {
++        let shared = TransportResetShared::new();
++        shared.completed.store(true, Ordering::Release);
++        Self {
++            shared,
++            started: Instant::now(),
++        }
++    }
++
++    /// Handle for a reset that was already published by an earlier request.
++    pub fn already_published(shared: Arc<TransportResetShared>) -> Self {
++        shared.completed.store(true, Ordering::Release);
++        shared.published.store(true, Ordering::Release);
++        Self {
++            shared,
++            started: Instant::now(),
++        }
++    }
++
++    pub fn new(shared: Arc<TransportResetShared>) -> Self {
++        Self {
++            shared,
++            started: Instant::now(),
++        }
++    }
++
++    /// Wait up to `timeout` for the worker to publish and for the guest to
++    /// acknowledge. Returns as soon as both outcomes are known.
++    pub fn wait(&self, timeout: Duration) -> TransportResetResult {
++        let deadline = self.started + timeout;
++
++        loop {
++            if self.shared.completed.load(Ordering::Acquire) {
++                break;
++            }
++            let now = Instant::now();
++            if now >= deadline {
++                warn!("transport reset: worker did not process the request before timeout");
++                return TransportResetResult::default();
++            }
++            thread::sleep((deadline - now).min(Duration::from_millis(1)));
++        }
++
++        if !self.shared.published.load(Ordering::Acquire) {
++            return TransportResetResult::default();
++        }
++
++        loop {
++            if self.shared.acked.load(Ordering::Acquire) {
++                return TransportResetResult {
++                    published: true,
++                    acked: true,
++                };
++            }
++            let now = Instant::now();
++            if now >= deadline {
++                return TransportResetResult {
++                    published: true,
++                    acked: false,
++                };
++            }
++            thread::sleep((deadline - now).min(Duration::from_millis(1)));
++        }
++    }
++}
++
+ #[derive(Clone)]
+ pub struct VirtioSharedMemory {
+     pub offset: u64,
+@@ -172,6 +290,13 @@ pub trait VirtioDevice: Send {
+     /// Set the access platform trait to let the device perform address
+     /// translations if needed.
+     fn set_access_platform(&mut self, _access_platform: Arc<dyn AccessPlatform>) {}
++
++    /// Start publishing a transport reset to the guest while the VM is
++    /// running. The returned handle must be waited on without holding the
++    /// device lock. Devices without transport reset support return `None`.
++    fn reset_transport(&mut self) -> Option<TransportResetHandle> {
++        None
++    }
+ }
+ 
+ /// Trait to define address translation for devices managed by virtio-iommu
+diff --git a/virtio-devices/src/lib.rs b/virtio-devices/src/lib.rs
+index da4f1c9..ef73442 100644
+--- a/virtio-devices/src/lib.rs
++++ b/virtio-devices/src/lib.rs
+@@ -42,8 +42,8 @@ pub use self::balloon::Balloon;
+ pub use self::block::{Block, BlockState};
+ pub use self::console::{Console, ConsoleResizer, Endpoint};
+ pub use self::device::{
+-    DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt, VirtioInterruptType,
+-    VirtioSharedMemoryList,
++    DmaRemapping, TransportResetHandle, TransportResetResult, TransportResetShared, VirtioCommon,
++    VirtioDevice, VirtioInterrupt, VirtioInterruptType, VirtioSharedMemoryList,
+ };
+ pub use self::epoll_helper::{
+     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
+diff --git a/virtio-devices/src/vsock/device.rs b/virtio-devices/src/vsock/device.rs
+index 96341a0..296a362 100644
+--- a/virtio-devices/src/vsock/device.rs
++++ b/virtio-devices/src/vsock/device.rs
+@@ -9,15 +9,17 @@
+ // found in the THIRD-PARTY file.
+ 
+ use std::mem::size_of;
++use std::ops::Deref;
+ use std::os::unix::io::AsRawFd;
+ use std::path::PathBuf;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::{Arc, Barrier, RwLock};
+-use std::{io, result};
++use std::sync::{Arc, Barrier, Mutex, RwLock};
++use std::{env, io, result};
+ 
+ use anyhow::anyhow;
+ use byteorder::{ByteOrder, LittleEndian};
+ use event_monitor::event;
++use libc::EFD_NONBLOCK;
+ use log::{debug, error, info, warn};
+ use seccompiler::SeccompAction;
+ use serde::{Deserialize, Serialize};
+@@ -51,9 +53,9 @@ use crate::seccomp_filters::Thread;
+ use crate::thread_helper::spawn_virtio_thread;
+ use crate::{
+     ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
+-    EpollHelperHandler, Error as DeviceError, GuestMemoryMmap, VIRTIO_F_IN_ORDER,
+-    VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType,
+-    VirtioInterrupt, VirtioInterruptType,
++    EpollHelperHandler, Error as DeviceError, GuestMemoryMmap, TransportResetHandle,
++    TransportResetShared, VIRTIO_F_IN_ORDER, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1,
++    VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt, VirtioInterruptType,
+ };
+ 
+ const QUEUE_SIZE: u16 = 256;
+@@ -70,6 +72,64 @@ pub const TX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
+ pub const EVT_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+ // Notification coming from the backend.
+ pub const BACKEND_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
++// Request from the VMM thread to publish a transport reset from the worker
++// while the VM keeps running.
++pub const VSOCK_RESET_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
++
++/// Failure-injection knobs for the transport reset path. They are only parsed
++/// when `KUASAR_TEST_HOOKS=1`, so a production binary ignores them entirely.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct VsockResetHooks {
++    /// Defer the first acknowledgement so a snapshot falls back to the gate.
++    pub delay_ack: bool,
++    /// Never acknowledge; the guest looks unresponsive.
++    pub drop_ack: bool,
++    /// Pretend the guest has no event descriptor available.
++    pub no_desc: bool,
++    /// Publish the event but report a failed publish to the API caller.
++    pub fail_after_publish: bool,
++    /// Inject a kick without an avail index advance after publishing.
++    pub stale_kick: bool,
++}
++
++impl VsockResetHooks {
++    fn from_env() -> Self {
++        // Release binaries ignore the test hooks completely, even when the
++        // environment variables are present. A test build can opt in through
++        // the `kuasar-test-hooks` feature.
++        if !cfg!(any(debug_assertions, feature = "kuasar-test-hooks")) {
++            return Self::default();
++        }
++
++        if env::var("KUASAR_TEST_HOOKS").ok().as_deref() != Some("1") {
++            return Self::default();
++        }
++
++        let Ok(spec) = env::var("KUASAR_VSOCK_RESET_HOOKS") else {
++            return Self::default();
++        };
++
++        let mut hooks = Self::default();
++        for hook in spec.split(',').map(str::trim).filter(|h| !h.is_empty()) {
++            match hook {
++                "delay-ack" => hooks.delay_ack = true,
++                "drop-ack" => hooks.drop_ack = true,
++                "no-desc" => hooks.no_desc = true,
++                "fail-after-publish" => hooks.fail_after_publish = true,
++                "stale-kick" => hooks.stale_kick = true,
++                other => warn!("vsock: ignoring unknown KUASAR_VSOCK_RESET_HOOKS value {other:?}"),
++            }
++        }
++
++        if hooks.delay_ack || hooks.drop_ack || hooks.no_desc
++            || hooks.fail_after_publish || hooks.stale_kick
++        {
++            info!("vsock: KUASAR transport reset test hooks enabled: {hooks:?}");
++        }
++
++        hooks
++    }
++}
+ 
+ /// The `VsockEpollHandler` implements the runtime logic of our vsock device:
+ /// 1. Respond to TX queue events by wrapping virtio buffers into `VsockPacket`s, then sending those
+@@ -99,6 +159,19 @@ pub struct VsockEpollHandler<B: VsockBackend> {
+     pub backend: Arc<RwLock<B>>,
+     pub access_platform: Option<Arc<dyn AccessPlatform>>,
+     pub transport_reset_pending: Arc<AtomicBool>,
++    /// Whether a transport reset event has been published since the last
++    /// activate/resume/reset. Never serialized.
++    pub reset_published: Arc<AtomicBool>,
++    /// Shared state for a running reset, also used to poll the outcome from
++    /// the VMM thread without holding the device lock.
++    pub reset_shared: Option<Arc<TransportResetShared>>,
++    /// Command eventfd; a write asks the worker to publish a reset.
++    pub reset_cmd_evt: Option<EventFd>,
++    /// The event queue instance shared with the device runtime. The worker and
++    /// the snapshot path must use the same queue object, otherwise their
++    /// next_avail/next_used bookkeeping diverges after a running reset.
++    pub event_queue: Option<Arc<Mutex<Queue>>>,
++    pub reset_hooks: VsockResetHooks,
+ }
+ 
+ impl<B> VsockEpollHandler<B>
+@@ -119,6 +192,163 @@ where
+             })
+     }
+ 
++    /// Drop event queue notifications that predate a transport reset. A kick
++    /// only advertises descriptors already visible through the avail ring, so
++    /// it cannot acknowledge a reset that has not been published yet.
++    fn drain_evt_kicks(&self) {
++        loop {
++            match self.queue_evts[EVT_QUEUE_INDEX].read() {
++                Ok(_) => {}
++                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
++                Err(err) => {
++                    warn!("vsock: failed to drain event queue kick: {err:?}");
++                    break;
++                }
++            }
++        }
++    }
++
++    fn report_publish_failure(&self, shared: &TransportResetShared, reason: &str) {
++        shared.published.store(false, Ordering::Release);
++        shared.completed.store(true, Ordering::Release);
++        warn!("vsock: transport reset not published ({reason})");
++    }
++
++    /// Publish VIRTIO_VSOCK_EVENT_TRANSPORT_RESET from the worker using its
++    /// live queues. Returns whether the event was published.
++    ///
++    /// This runs while the VM is running, which is why the config space and
++    /// the used ring are updated from the worker instead of the VMM thread.
++    fn publish_transport_reset(&mut self) -> bool {
++        let Some(shared) = self.reset_shared.clone() else {
++            return false;
++        };
++
++        shared.outstanding.store(false, Ordering::Release);
++
++        // Idempotency: the device already published a reset since the last
++        // activate/resume/reset. Report the current acknowledgement state
++        // instead of injecting a second event.
++        if self.reset_published.load(Ordering::Acquire) {
++            info!("vsock: transport reset already published, not publishing again (running reset)");
++            shared.published.store(true, Ordering::Release);
++            shared.completed.store(true, Ordering::Release);
++            return true;
++        }
++
++        // A pending reset means an event is already sitting in the used ring
++        // (restored device, or an acknowledgement that has not arrived yet).
++        // Publishing again would double the event.
++        if self.transport_reset_pending.load(Ordering::Acquire) {
++            info!("vsock: transport reset already pending, not publishing again (running reset)");
++            self.reset_published.store(true, Ordering::Release);
++            shared.published.store(true, Ordering::Release);
++            shared.completed.store(true, Ordering::Release);
++            return true;
++        }
++
++        self.drain_evt_kicks();
++
++        if self.reset_hooks.no_desc {
++            self.report_publish_failure(&shared, "no descriptor (test hook)");
++            return false;
++        }
++
++        let Some(event_queue) = self.event_queue.clone() else {
++            self.report_publish_failure(&shared, "no shared event queue");
++            return false;
++        };
++        let mut queue = event_queue.lock().unwrap();
++
++        let baseline = match queue.avail_idx(self.mem.memory().deref(), Ordering::Acquire) {
++            Ok(idx) => idx.0,
++            Err(err) => {
++                self.report_publish_failure(&shared, &format!("cannot read avail index: {err:?}"));
++                return false;
++            }
++        };
++
++        let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) else {
++            self.report_publish_failure(&shared, "event queue has no available descriptor");
++            return false;
++        };
++
++        let Some(desc) = desc_chain.next() else {
++            queue.go_to_previous_position();
++            self.report_publish_failure(&shared, "event descriptor chain is empty");
++            return false;
++        };
++
++        if !desc.is_write_only() || desc.len() < size_of::<u32>() as u32 {
++            let write_only = desc.is_write_only();
++            let len = desc.len();
++            queue.go_to_previous_position();
++            self.report_publish_failure(
++                &shared,
++                &format!("invalid event descriptor: write_only={write_only}, len={len}"),
++            );
++            return false;
++        }
++
++        let addr = desc
++            .addr()
++            .translate_gva(self.access_platform.as_deref(), size_of::<u32>());
++        if let Err(err) = desc_chain
++            .memory()
++            .write_obj(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le(), addr)
++        {
++            queue.go_to_previous_position();
++            self.report_publish_failure(
++                &shared,
++                &format!("failed to write transport reset event: {err:?}"),
++            );
++            return false;
++        }
++
++        if let Err(err) = queue.add_used(
++            desc_chain.memory(),
++            desc_chain.head_index(),
++            size_of::<u32>() as u32,
++        ) {
++            self.report_publish_failure(
++                &shared,
++                &format!("failed to publish transport reset event: {err:?}"),
++            );
++            return false;
++        }
++        drop(queue);
++
++        // Record the driver's avail index before the guest can consume the
++        // used entry; the acknowledgement requires advancing it.
++        shared.expected_avail.store(baseline.into(), Ordering::Release);
++        shared.acked.store(false, Ordering::Release);
++        self.transport_reset_pending.store(true, Ordering::Release);
++        self.reset_published.store(true, Ordering::Release);
++
++        if let Err(err) = self.signal_used_queue(EVT_QUEUE_INDEX as u16) {
++            // The used entry and pending state are the contract; the guest
++            // will see them on the next notification or after resume.
++            warn!("vsock: failed to signal running transport reset event: {err:?}");
++        }
++        info!("vsock: transport reset published (running reset); waiting for guest acknowledgement");
++
++        if self.reset_hooks.stale_kick {
++            match self.queue_evts[EVT_QUEUE_INDEX].write(1) {
++                Ok(_) => info!("vsock: injected stale event queue kick (test hook)"),
++                Err(err) => warn!("vsock: failed to inject stale kick: {err:?}"),
++            }
++        }
++
++        let reported = !self.reset_hooks.fail_after_publish;
++        if !reported {
++            error!("vsock: transport reset published but reporting failure (test hook)");
++        }
++        shared.published.store(reported, Ordering::Release);
++        shared.completed.store(true, Ordering::Release);
++
++        true
++    }
++
+     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we
+     /// have pending.
+     ///
+@@ -225,6 +455,9 @@ where
+         helper.add_event(self.queue_evts[0].as_raw_fd(), RX_QUEUE_EVENT)?;
+         helper.add_event(self.queue_evts[1].as_raw_fd(), TX_QUEUE_EVENT)?;
+         helper.add_event(self.queue_evts[2].as_raw_fd(), EVT_QUEUE_EVENT)?;
++        if let Some(cmd) = &self.reset_cmd_evt {
++            helper.add_event(cmd.as_raw_fd(), VSOCK_RESET_EVENT)?;
++        }
+         helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
+         helper.run(paused, paused_sync, self)?;
+ 
+@@ -293,8 +526,15 @@ where
+                         )));
+                     }
+                 };
+-                if kick_seen && self.transport_reset_pending.swap(false, Ordering::AcqRel) {
+-                    info!("vsock: guest acknowledged transport reset");
++                if !kick_seen || !self.transport_reset_pending.load(Ordering::Acquire) {
++                    return Ok(());
++                }
++
++                let Some(shared) = self.reset_shared.clone() else {
++                    // No shared state (legacy path): the kick is the only
++                    // signal available, keep the restored-gate behaviour.
++                    self.transport_reset_pending.store(false, Ordering::Release);
++                    info!("vsock: guest acknowledged transport reset (restore gate)");
+                     if self.backend.read().unwrap().has_pending_rx() {
+                         self.process_rx().map_err(|e| {
+                             EpollHelperError::HandleEvent(anyhow!(
+@@ -302,7 +542,75 @@ where
+                             ))
+                         })?;
+                     }
++                    return Ok(());
++                };
++
++                // A bare kick must not count as an acknowledgement. The guest
++                // acknowledges by returning the descriptor, which advances the
++                // event queue avail index.
++                let expected = shared.expected_avail.load(Ordering::Acquire) as u16;
++                let Some(event_queue) = self.event_queue.as_ref() else {
++                    return Ok(());
++                };
++                let current = match event_queue
++                    .lock()
++                    .unwrap()
++                    .avail_idx(self.mem.memory().deref(), Ordering::Acquire)
++                {
++                    Ok(idx) => idx.0,
++                    Err(err) => {
++                        warn!("vsock: failed to read event queue avail index: {err:?}");
++                        return Ok(());
++                    }
++                };
++                if current == expected {
++                    debug!("vsock: event queue kick without avail advance; not an ACK");
++                    return Ok(());
++                }
++
++                let running = self.reset_published.load(Ordering::Acquire);
++                let label = if running {
++                    "running reset"
++                } else {
++                    "snapshot-stage/restore gate"
++                };
++
++                if self.reset_hooks.drop_ack {
++                    info!("vsock: transport reset ACK dropped (test hook, {label})");
++                    return Ok(());
++                }
++                if self.reset_hooks.delay_ack && !shared.ack_deferred.swap(true, Ordering::AcqRel) {
++                    shared.ack_ready.store(true, Ordering::Release);
++                    info!("vsock: transport reset ACK deferred (test hook, {label})");
++                    return Ok(());
++                }
++
++                shared.acked.store(true, Ordering::Release);
++                self.transport_reset_pending.store(false, Ordering::Release);
++                info!("vsock: guest acknowledged transport reset ({label})");
++                if self.backend.read().unwrap().has_pending_rx() {
++                    self.process_rx().map_err(|e| {
++                        EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to process RX queue after transport reset: {e:?}"
++                        ))
++                    })?;
++                }
++            }
++            VSOCK_RESET_EVENT => {
++                debug!("vsock: transport reset command");
++                let Some(cmd) = &self.reset_cmd_evt else {
++                    return Ok(());
++                };
++                match cmd.read() {
++                    Ok(_) => {}
++                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
++                    Err(err) => {
++                        return Err(EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to get transport reset command: {err:?}"
++                        )));
++                    }
+                 }
++                self.publish_transport_reset();
+             }
+             BACKEND_EVENT => {
+                 debug!("vsock: backend event");
+@@ -335,7 +643,7 @@ where
+ /// Virtio device exposing virtual socket to the guest.
+ struct VsockTransportResetRuntime {
+     mem: GuestMemoryAtomic<GuestMemoryMmap>,
+-    event_queue: Queue,
++    event_queue: Arc<Mutex<Queue>>,
+     event_queue_evt: EventFd,
+ }
+ 
+@@ -348,6 +656,13 @@ pub struct Vsock<B: VsockBackend> {
+     seccomp_action: SeccompAction,
+     exit_evt: EventFd,
+     transport_reset_pending: Arc<AtomicBool>,
++    /// A transport reset was published since the last activate/resume/reset.
++    /// Runtime only; never part of the serialized state.
++    reset_published: Arc<AtomicBool>,
++    /// Shared runtime state for publishing a reset while the VM is running.
++    reset_shared: Option<Arc<TransportResetShared>>,
++    /// Write side of the command eventfd used to ask the worker to publish.
++    reset_cmd_evt: Option<EventFd>,
+     transport_reset_runtime: Option<VsockTransportResetRuntime>,
+ }
+ 
+@@ -417,6 +732,9 @@ where
+             seccomp_action,
+             exit_evt,
+             transport_reset_pending: Arc::new(AtomicBool::new(transport_reset_pending)),
++            reset_published: Arc::new(AtomicBool::new(false)),
++            reset_shared: None,
++            reset_cmd_evt: None,
+             transport_reset_runtime: None,
+         })
+     }
+@@ -446,9 +764,15 @@ where
+             }
+         }
+ 
+-        let queue = &mut runtime.event_queue;
++        let queue = runtime.event_queue.clone();
++        let mem = runtime.mem.memory();
++        let mut queue = queue.lock().unwrap();
++        let baseline = queue
++            .avail_idx(mem.deref(), Ordering::Acquire)
++            .map_err(|err| anyhow!("failed to read vsock event queue avail index: {err:?}"))?
++            .0;
+         let mut desc_chain = queue
+-            .pop_descriptor_chain(runtime.mem.memory())
++            .pop_descriptor_chain(mem)
+             .ok_or_else(|| anyhow!("vsock event queue has no available descriptor"))?;
+         let desc = desc_chain
+             .next()
+@@ -477,7 +801,12 @@ where
+             )
+             .map_err(|e| anyhow!("failed to publish vsock transport reset event: {e:?}"))?;
+ 
++        if let Some(shared) = &self.reset_shared {
++            shared.expected_avail.store(baseline.into(), Ordering::Release);
++            shared.acked.store(false, Ordering::Release);
++        }
+         self.transport_reset_pending.store(true, Ordering::Release);
++        self.reset_published.store(true, Ordering::Release);
+         if let Some(interrupt_cb) = &self.common.interrupt_cb
+             && let Err(err) =
+                 interrupt_cb.trigger(VirtioInterruptType::Queue(EVT_QUEUE_INDEX as u16))
+@@ -486,7 +815,10 @@ where
+             // Restore activation and source resume both re-signal this interrupt.
+             warn!("failed to signal staged vsock transport reset event: {err:?}");
+         }
+-        info!("vsock: transport reset staged; waiting for guest acknowledgement");
++        info!(
++            "vsock: transport reset staged for snapshot; waiting for guest acknowledgement \
++             (snapshot-stage)"
++        );
+         Ok(())
+     }
+ 
+@@ -577,9 +909,43 @@ where
+             error!("failed to clone virtio-vsock event queue eventfd: {err}");
+             ActivateError::BadActivate
+         })?;
++
++        // A fresh reset command channel per activation. A stale command from a
++        // previous activation must never be interpreted by the new worker.
++        let reset_shared = TransportResetShared::new();
++        let reset_cmd_evt = EventFd::new(EFD_NONBLOCK).map_err(|err| {
++            error!("failed to create virtio-vsock transport reset eventfd: {err}");
++            ActivateError::BadActivate
++        })?;
++        let handler_reset_cmd_evt = reset_cmd_evt.try_clone().map_err(|err| {
++            error!("failed to clone virtio-vsock transport reset eventfd: {err}");
++            ActivateError::BadActivate
++        })?;
++        self.reset_published.store(false, Ordering::Release);
++
++        // Both the worker and the snapshot path must use the same queue object.
++        // Separate copies would diverge (next_avail/next_used) as soon as one
++        // side consumes a descriptor.
++        let shared_event_queue = Arc::new(Mutex::new(clone_queue(event_queue)));
++
++        // A restored pending reset has no recorded baseline: the guest has
++        // not run yet, so the current avail index is the reference it has to
++        // advance from when it returns the event descriptor.
++        if self.transport_reset_pending.load(Ordering::Acquire)
++            && let Ok(idx) = shared_event_queue
++                .lock()
++                .unwrap()
++                .avail_idx(mem.memory().deref(), Ordering::Acquire)
++        {
++            reset_shared.expected_avail.store(idx.0.into(), Ordering::Release);
++        }
++
++        self.reset_shared = Some(reset_shared.clone());
++        self.reset_cmd_evt = Some(reset_cmd_evt);
++
+         self.transport_reset_runtime = Some(VsockTransportResetRuntime {
+             mem: mem.clone(),
+-            event_queue: clone_queue(event_queue),
++            event_queue: shared_event_queue.clone(),
+             event_queue_evt,
+         });
+ 
+@@ -593,6 +959,11 @@ where
+             backend: self.backend.clone(),
+             access_platform: self.common.access_platform.clone(),
+             transport_reset_pending: self.transport_reset_pending.clone(),
++            reset_published: self.reset_published.clone(),
++            reset_shared: Some(reset_shared),
++            reset_cmd_evt: Some(handler_reset_cmd_evt),
++            event_queue: Some(shared_event_queue),
++            reset_hooks: VsockResetHooks::from_env(),
+         };
+ 
+         if self.transport_reset_pending.load(Ordering::Acquire) {
+@@ -627,11 +998,54 @@ where
+     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
+         let result = self.common.reset();
+         self.transport_reset_runtime = None;
++        self.reset_shared = None;
++        self.reset_cmd_evt = None;
++        self.reset_published.store(false, Ordering::Release);
+         self.transport_reset_pending.store(false, Ordering::Release);
+         event!("virtio-device", "reset", "id", &self.id);
+         result
+     }
+ 
++    fn reset_transport(&mut self) -> Option<TransportResetHandle> {
++        let Some(cmd) = &self.reset_cmd_evt else {
++            // Inactive device: it cannot have live guest connections.
++            warn!("vsock: transport reset not published (device is not active)");
++            return Some(TransportResetHandle::not_published());
++        };
++        let Some(shared) = &self.reset_shared else {
++            warn!("vsock: transport reset not published (no reset runtime)");
++            return Some(TransportResetHandle::not_published());
++        };
++
++        if self.reset_published.load(Ordering::Acquire) {
++            info!("vsock: transport reset already published; not publishing again");
++            return Some(TransportResetHandle::already_published(shared.clone()));
++        }
++
++        if shared.outstanding.load(Ordering::Acquire) {
++            // A previous request has not reached the worker yet. Wait for it
++            // instead of queueing a second command, otherwise the worker could
++            // publish two events.
++            info!("vsock: transport reset already queued; waiting for the pending command");
++            return Some(TransportResetHandle::new(shared.clone()));
++        }
++
++        shared.completed.store(false, Ordering::Release);
++        shared.published.store(false, Ordering::Release);
++        shared.acked.store(false, Ordering::Release);
++        shared.outstanding.store(true, Ordering::Release);
++
++        if let Err(err) = cmd.write(1) {
++            shared.outstanding.store(false, Ordering::Release);
++            shared.completed.store(true, Ordering::Release);
++            error!("vsock: failed to queue transport reset command: {err:?}");
++            return Some(TransportResetHandle::not_published());
++        }
++
++        info!("vsock: queued running transport reset; waiting for the worker");
++        Some(TransportResetHandle::new(shared.clone()))
++    }
++
+     fn shutdown(&mut self) {
+         std::fs::remove_file(&self.path).ok();
+     }
+@@ -650,6 +1064,20 @@ where
+     }
+ 
+     fn resume(&mut self) -> result::Result<(), MigratableError> {
++        self.reset_published.store(false, Ordering::Release);
++        if self.transport_reset_pending.load(Ordering::Acquire) {
++            // A deferred ACK (test hook) already saw the guest return the
++            // event descriptor; apply it now so the source VM is not left
++            // gated after resume.
++            if let Some(shared) = &self.reset_shared
++                && shared.ack_ready.load(Ordering::Acquire)
++                && shared.ack_deferred.load(Ordering::Acquire)
++            {
++                shared.acked.store(true, Ordering::Release);
++                self.transport_reset_pending.store(false, Ordering::Release);
++                info!("vsock: applied deferred transport reset ACK on resume");
++            }
++        }
+         if self.transport_reset_pending.load(Ordering::Acquire) {
+             if let Some(interrupt_cb) = &self.common.interrupt_cb {
+                 interrupt_cb
+@@ -674,11 +1102,22 @@ where
+     }
+ 
+     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+-        self.stage_transport_reset_event().map_err(|err| {
+-            MigratableError::Snapshot(anyhow!(
+-                "failed to stage vsock transport reset before snapshot: {err:#}"
+-            ))
+-        })?;
++        if self.reset_published.load(Ordering::Acquire) {
++            // A reset was already published while the VM was running (or an
++            // earlier snapshot staged it). Stage nothing: the guest either
++            // already acknowledged it or the pending gate must be preserved.
++            info!(
++                "vsock: snapshot keeps already-published transport reset \
++                 (pending={}); not staging again",
++                self.transport_reset_pending.load(Ordering::Acquire)
++            );
++        } else {
++            self.stage_transport_reset_event().map_err(|err| {
++                MigratableError::Snapshot(anyhow!(
++                    "failed to stage vsock transport reset before snapshot: {err:#}"
++                ))
++            })?;
++        }
+         Snapshot::new_from_state(&self.state())
+     }
+ }
+@@ -687,13 +1126,84 @@ impl<B> Migratable for Vsock<B> where B: VsockBackend + Sync + 'static {}
+ 
+ #[cfg(test)]
+ mod unit_tests {
++    use std::time::Duration;
++
+     use libc::EFD_NONBLOCK;
+ 
+-    use super::super::unit_tests::{NoopVirtioInterrupt, TestBackend, TestContext};
++    use super::super::unit_tests::{
++        EpollHandlerContext, NoopVirtioInterrupt, TestBackend, TestContext,
++    };
+     use super::super::*;
+     use super::*;
+     use crate::ActivateError;
+ 
++    const RESET_EVENT_ADDR: u64 = 0x0060_0000;
++
++    fn prepare_reset_event_queue(test_ctx: &TestContext, ctx: &mut EpollHandlerContext<'_>) {
++        ctx.guest_evvq.dtable[0].set(
++            RESET_EVENT_ADDR,
++            size_of::<u32>() as u32,
++            virtio_bindings::virtio_ring::VRING_DESC_F_WRITE
++                .try_into()
++                .unwrap(),
++            0,
++        );
++        ctx.guest_evvq.avail.ring[0].set(0);
++        ctx.guest_evvq.avail.idx.set(1);
++        test_ctx
++            .mem
++            .write_obj(u32::MAX, vm_memory::GuestAddress(RESET_EVENT_ADDR))
++            .unwrap();
++    }
++
++    /// Simulate the guest consuming the reset event and returning a fresh
++    /// descriptor: avail index advances and the driver kicks the device.
++    fn guest_refill_event_queue(ctx: &mut EpollHandlerContext<'_>) {
++        let next = ctx.guest_evvq.avail.idx.get();
++        ctx.guest_evvq.avail.ring[(next % 2) as usize].set(0);
++        ctx.guest_evvq.avail.idx.set(next + 1);
++        ctx.signal_evtq_event();
++    }
++
++    fn dispatch_reset_command(ctx: &mut EpollHandlerContext<'_>) {
++        let event = epoll::Event::new(epoll::Events::EPOLLIN, VSOCK_RESET_EVENT as u64);
++        let mut epoll_helper =
++            EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
++        ctx.handler.handle_event(&mut epoll_helper, &event).unwrap();
++    }
++
++    /// Build a device sharing its reset runtime with the handler, which is what
++    /// activation does in production.
++    fn wired_device(
++        test_ctx: &TestContext,
++        ctx: &EpollHandlerContext<'_>,
++        name: &str,
++    ) -> Vsock<TestBackend> {
++        let mut device = Vsock::new(
++            String::from(name),
++            test_ctx.cid as u32,
++            PathBuf::from(format!("/test/{name}")),
++            TestBackend::new(),
++            false,
++            seccompiler::SeccompAction::Trap,
++            EventFd::new(EFD_NONBLOCK).unwrap(),
++            None,
++        )
++        .unwrap();
++        device.transport_reset_pending = ctx.handler.transport_reset_pending.clone();
++        device.reset_published = ctx.reset_published.clone();
++        device.reset_shared = Some(ctx.reset_shared.clone());
++        device.reset_cmd_evt = Some(ctx.reset_cmd_evt.try_clone().unwrap());
++        device.transport_reset_runtime = Some(VsockTransportResetRuntime {
++            mem: GuestMemoryAtomic::new(test_ctx.mem.clone()),
++            event_queue: ctx.event_queue.clone(),
++            event_queue_evt: ctx.handler.queue_evts[EVT_QUEUE_INDEX]
++                .try_clone()
++                .unwrap(),
++        });
++        device
++    }
++
+     #[test]
+     fn test_virtio_device() {
+         let mut ctx = TestContext::new();
+@@ -899,9 +1409,12 @@ mod unit_tests {
+         )
+         .unwrap();
+         device.transport_reset_pending = ctx.handler.transport_reset_pending.clone();
++        device.reset_published = ctx.reset_published.clone();
++        device.reset_shared = Some(ctx.reset_shared.clone());
++        device.reset_cmd_evt = Some(ctx.reset_cmd_evt.try_clone().unwrap());
+         device.transport_reset_runtime = Some(VsockTransportResetRuntime {
+             mem: GuestMemoryAtomic::new(test_ctx.mem.clone()),
+-            event_queue: clone_queue(&ctx.handler.queues[EVT_QUEUE_INDEX]),
++            event_queue: ctx.event_queue.clone(),
+             event_queue_evt: ctx.handler.queue_evts[EVT_QUEUE_INDEX]
+                 .try_clone()
+                 .unwrap(),
+@@ -961,6 +1474,10 @@ mod unit_tests {
+         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+         assert_eq!(ctx.handler.backend.read().unwrap().rx_ok_cnt, 0);
+ 
++        // The guest consumes the reset event and returns a fresh descriptor,
++        // which advances the event queue avail index.
++        ctx.guest_evvq.avail.ring[1].set(0);
++        ctx.guest_evvq.avail.idx.set(2);
+         ctx.signal_evtq_event();
+         assert!(
+             !ctx.handler
+@@ -971,6 +1488,193 @@ mod unit_tests {
+         assert_eq!(ctx.handler.backend.read().unwrap().rx_ok_cnt, 1);
+     }
+ 
++    #[test]
++    fn test_running_transport_reset_acked_snapshot_does_not_stage() {
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_epoll_handler_context();
++        prepare_reset_event_queue(&test_ctx, &mut ctx);
++        let mut device = wired_device(&test_ctx, &ctx, "running-reset-acked");
++
++        let handle = device.reset_transport().expect("vsock supports reset");
++        dispatch_reset_command(&mut ctx);
++
++        assert!(device.transport_reset_pending.load(Ordering::Acquire));
++        assert!(device.reset_published.load(Ordering::Acquire));
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++        assert_eq!(
++            test_ctx
++                .mem
++                .read_obj::<u32>(vm_memory::GuestAddress(RESET_EVENT_ADDR))
++                .unwrap(),
++            VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
++        );
++
++        guest_refill_event_queue(&mut ctx);
++        assert!(!device.transport_reset_pending.load(Ordering::Acquire));
++        assert!(ctx.reset_shared.acked.load(Ordering::Acquire));
++
++        let result = handle.wait(Duration::from_millis(100));
++        assert!(result.published);
++        assert!(result.acked);
++
++        // The running reset is already published: snapshot must serialize the
++        // current (acked) state and must not add a second used entry.
++        let snapshot = device.snapshot().unwrap();
++        let state: VsockState = snapshot.snapshot_data.unwrap().to_state().unwrap();
++        assert!(!state.transport_reset_pending);
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++    }
++
++    #[test]
++    fn test_running_transport_reset_timeout_snapshot_keeps_pending() {
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_epoll_handler_context();
++        prepare_reset_event_queue(&test_ctx, &mut ctx);
++        let mut device = wired_device(&test_ctx, &ctx, "running-reset-timeout");
++
++        let handle = device.reset_transport().expect("vsock supports reset");
++        dispatch_reset_command(&mut ctx);
++
++        let result = handle.wait(Duration::from_millis(5));
++        assert!(result.published);
++        assert!(!result.acked);
++        assert!(device.transport_reset_pending.load(Ordering::Acquire));
++
++        // Snapshot must not stage a second event and must preserve the gate.
++        let snapshot = device.snapshot().unwrap();
++        let state: VsockState = snapshot.snapshot_data.unwrap().to_state().unwrap();
++        assert!(state.transport_reset_pending);
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++    }
++
++    #[test]
++    fn test_running_transport_reset_late_ack_does_not_publish_twice() {
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_epoll_handler_context();
++        prepare_reset_event_queue(&test_ctx, &mut ctx);
++        let mut device = wired_device(&test_ctx, &ctx, "running-reset-late-ack");
++
++        let handle = device.reset_transport().expect("vsock supports reset");
++        dispatch_reset_command(&mut ctx);
++        let result = handle.wait(Duration::from_millis(5));
++        assert!(result.published);
++        assert!(!result.acked);
++        let _ = device.snapshot().unwrap();
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++
++        // The guest acknowledges after the API timeout.
++        guest_refill_event_queue(&mut ctx);
++        assert!(!device.transport_reset_pending.load(Ordering::Acquire));
++        assert!(ctx.reset_shared.acked.load(Ordering::Acquire));
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++
++        let snapshot = device.snapshot().unwrap();
++        let state: VsockState = snapshot.snapshot_data.unwrap().to_state().unwrap();
++        assert!(!state.transport_reset_pending);
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++    }
++
++    #[test]
++    fn test_resume_after_running_reset_stages_at_correct_used_slot() {
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_epoll_handler_context();
++        prepare_reset_event_queue(&test_ctx, &mut ctx);
++        let mut device = wired_device(&test_ctx, &ctx, "running-reset-resume-stage");
++
++        // Publish and acknowledge a reset while the VM is running.
++        let handle = device.reset_transport().expect("vsock supports reset");
++        dispatch_reset_command(&mut ctx);
++        guest_refill_event_queue(&mut ctx);
++        assert!(handle.wait(Duration::from_millis(50)).acked);
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++
++        // Source resume clears reset_published, so a later snapshot stages a
++        // new event. The worker and the snapshot path must share the event
++        // queue, otherwise the used ring bookkeeping has already diverged and
++        // the staged event would overwrite the previous used entry.
++        device.resume().unwrap();
++        assert!(!device.reset_published.load(Ordering::Acquire));
++        let snapshot = device.snapshot().unwrap();
++
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 2);
++        assert!(device.transport_reset_pending.load(Ordering::Acquire));
++        let state: VsockState = snapshot.snapshot_data.unwrap().to_state().unwrap();
++        assert!(state.transport_reset_pending);
++    }
++
++    #[test]
++    fn test_running_transport_reset_is_idempotent() {
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_epoll_handler_context();
++        prepare_reset_event_queue(&test_ctx, &mut ctx);
++        let mut device = wired_device(&test_ctx, &ctx, "running-reset-idempotent");
++
++        let first = device.reset_transport().expect("vsock supports reset");
++        dispatch_reset_command(&mut ctx);
++        guest_refill_event_queue(&mut ctx);
++        assert!(first.wait(Duration::from_millis(50)).acked);
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++
++        // A second call must not publish another event; it reports the
++        // acknowledgement state of the already published reset.
++        let second = device.reset_transport().expect("vsock supports reset");
++        dispatch_reset_command(&mut ctx);
++        let result = second.wait(Duration::from_millis(50));
++        assert!(result.published);
++        assert!(result.acked);
++        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
++    }
++
++    #[test]
++    fn test_transport_reset_lifecycle_clears_reset_published() {
++        let test_ctx = TestContext::new();
++        let mut device = Vsock::new(
++            String::from("reset-lifecycle"),
++            test_ctx.cid as u32,
++            PathBuf::from("/test/reset-lifecycle"),
++            TestBackend::new(),
++            false,
++            seccompiler::SeccompAction::Trap,
++            EventFd::new(EFD_NONBLOCK).unwrap(),
++            None,
++        )
++        .unwrap();
++
++        device.reset_published.store(true, Ordering::Release);
++        device.resume().unwrap();
++        assert!(!device.reset_published.load(Ordering::Acquire));
++
++        device.reset_published.store(true, Ordering::Release);
++        device
++            .activate(
++                GuestMemoryAtomic::new(test_ctx.mem.clone()),
++                Arc::new(NoopVirtioInterrupt {}),
++                vec![
++                    (
++                        0,
++                        Queue::new(256).unwrap(),
++                        EventFd::new(EFD_NONBLOCK).unwrap(),
++                    ),
++                    (
++                        1,
++                        Queue::new(256).unwrap(),
++                        EventFd::new(EFD_NONBLOCK).unwrap(),
++                    ),
++                    (
++                        2,
++                        Queue::new(256).unwrap(),
++                        EventFd::new(EFD_NONBLOCK).unwrap(),
++                    ),
++                ],
++            )
++            .unwrap();
++        assert!(!device.reset_published.load(Ordering::Acquire));
++
++        device.reset_published.store(true, Ordering::Release);
++        assert!(device.reset().is_some());
++        assert!(!device.reset_published.load(Ordering::Acquire));
++    }
++
+     #[test]
+     fn test_irq() {
+         // Test case: successful IRQ signaling.
+diff --git a/virtio-devices/src/vsock/mod.rs b/virtio-devices/src/vsock/mod.rs
+index b89a90c..36ef389 100644
+--- a/virtio-devices/src/vsock/mod.rs
++++ b/virtio-devices/src/vsock/mod.rs
+@@ -171,7 +171,7 @@ pub mod unit_tests {
+     use std::os::unix::io::AsRawFd;
+     use std::path::PathBuf;
+     use std::sync::atomic::AtomicBool;
+-    use std::sync::{Arc, RwLock};
++    use std::sync::{Arc, Mutex, RwLock};
+ 
+     use libc::EFD_NONBLOCK;
+     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+@@ -179,10 +179,13 @@ pub mod unit_tests {
+     use vm_virtio::queue::testing::VirtQueue as GuestQ;
+     use vmm_sys_util::eventfd::EventFd;
+ 
+-    use super::device::{EVT_QUEUE_EVENT, RX_QUEUE_EVENT, TX_QUEUE_EVENT, VsockEpollHandler};
++    use super::device::{
++        EVT_QUEUE_EVENT, RX_QUEUE_EVENT, TX_QUEUE_EVENT, VSOCK_RESET_EVENT, VsockEpollHandler,
++        VsockResetHooks,
++    };
+     use super::packet::VSOCK_PKT_HDR_SIZE;
+     use super::*;
+-    use crate::device::{VirtioInterrupt, VirtioInterruptType};
++    use crate::device::{TransportResetShared, VirtioInterrupt, VirtioInterruptType};
+     use crate::epoll_helper::EpollHelperHandler;
+     use crate::{EpollHelper, GuestMemoryMmap};
+ 
+@@ -343,10 +346,20 @@ pub mod unit_tests {
+             ];
+             let interrupt_cb = Arc::new(NoopVirtioInterrupt {});
+ 
++            let reset_shared = TransportResetShared::new();
++            let reset_cmd_evt = EventFd::new(EFD_NONBLOCK).unwrap();
++            let handler_reset_cmd_evt = reset_cmd_evt.try_clone().unwrap();
++            let reset_published = Arc::new(AtomicBool::new(false));
++            let shared_event_queue = Arc::new(Mutex::new(vm_virtio::clone_queue(&queues[2])));
++
+             EpollHandlerContext {
+                 guest_rxvq,
+                 guest_txvq,
+                 guest_evvq,
++                reset_shared: reset_shared.clone(),
++                reset_published: reset_published.clone(),
++                reset_cmd_evt,
++                event_queue: shared_event_queue.clone(),
+                 handler: VsockEpollHandler {
+                     mem: GuestMemoryAtomic::new(self.mem.clone()),
+                     queues,
+@@ -357,6 +370,11 @@ pub mod unit_tests {
+                     backend: Arc::new(RwLock::new(TestBackend::new())),
+                     access_platform: None,
+                     transport_reset_pending: Arc::new(AtomicBool::new(false)),
++                    reset_published,
++                    reset_shared: Some(reset_shared),
++                    reset_cmd_evt: Some(handler_reset_cmd_evt),
++                    event_queue: Some(shared_event_queue),
++                    reset_hooks: VsockResetHooks::default(),
+                 },
+             }
+         }
+@@ -367,6 +385,10 @@ pub mod unit_tests {
+         pub guest_rxvq: GuestQ<'a>,
+         pub guest_txvq: GuestQ<'a>,
+         pub guest_evvq: GuestQ<'a>,
++        pub reset_shared: Arc<TransportResetShared>,
++        pub reset_published: Arc<AtomicBool>,
++        pub reset_cmd_evt: EventFd,
++        pub event_queue: Arc<Mutex<virtio_queue::Queue>>,
+     }
+ 
+     impl EpollHandlerContext<'_> {
+@@ -394,5 +416,13 @@ pub mod unit_tests {
+                 EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
+             self.handler.handle_event(&mut epoll_helper, &event).ok();
+         }
++        pub fn signal_reset_event(&mut self) {
++            self.reset_cmd_evt.write(1).unwrap();
++            let events = epoll::Events::EPOLLIN;
++            let event = epoll::Event::new(events, VSOCK_RESET_EVENT as u64);
++            let mut epoll_helper =
++                EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
++            self.handler.handle_event(&mut epoll_helper, &event).ok();
++        }
+     }
+ }
+diff --git a/vmm/src/api/http/http_endpoint.rs b/vmm/src/api/http/http_endpoint.rs
+index a5a2ad0..cc2b7dc 100644
+--- a/vmm/src/api/http/http_endpoint.rs
++++ b/vmm/src/api/http/http_endpoint.rs
+@@ -49,6 +49,7 @@ use crate::api::{
+     VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters, VmDelete, VmDirtyMemory,
+     VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize,
+     VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
++    VmVsockReset, VmVsockResetData,
+ };
+ use crate::config::RestoreConfig;
+ use crate::cpu::Error as CpuError;
+@@ -434,6 +435,28 @@ vm_action_put_handler_body!(VmSendMigration);
+ #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+ vm_action_put_handler_body!(VmCoredump);
+ 
++// The vsock reset body is optional: an empty request means "use the default
++// timeout".
++impl PutHandler for VmVsockReset {
++    fn handle_request(
++        &'static self,
++        api_notifier: EventFd,
++        api_sender: Sender<ApiRequest>,
++        body: &Option<Body>,
++        _files: Vec<File>,
++    ) -> std::result::Result<Option<Body>, HttpError> {
++        let reset_data = match body {
++            Some(body) if !body.raw().is_empty() => serde_json::from_slice(body.raw())?,
++            _ => VmVsockResetData::default(),
++        };
++
++        self.send(api_notifier, api_sender, reset_data)
++            .map_err(HttpError::ApiError)
++    }
++}
++
++impl GetHandler for VmVsockReset {}
++
+ // Special handling for virtio-net devices backed by network FDs.
+ // See module description for more info.
+ impl PutHandler for VmAddNet {
+diff --git a/vmm/src/api/http/mod.rs b/vmm/src/api/http/mod.rs
+index 27823a4..d3280f6 100644
+--- a/vmm/src/api/http/mod.rs
++++ b/vmm/src/api/http/mod.rs
+@@ -31,7 +31,7 @@ use crate::api::{
+     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem, VmAddUserDevice,
+     VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmDirtyMemory, VmNmi, VmPause,
+     VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
+-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
++    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmVsockReset,
+ };
+ use crate::landlock::Landlock;
+ use crate::seccomp_filters::{Thread, get_seccomp_filter};
+@@ -283,6 +283,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
+         endpoint!("/vm.snapshot"),
+         Box::new(VmActionHandler::new(&VmSnapshot)),
+     );
++    r.routes.insert(
++        endpoint!("/vm.vsock-reset"),
++        Box::new(VmActionHandler::new(&VmVsockReset)),
++    );
+     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+     r.routes.insert(
+         endpoint!("/vm.coredump"),
+diff --git a/vmm/src/api/mod.rs b/vmm/src/api/mod.rs
+index 4e966fb..cface75 100644
+--- a/vmm/src/api/mod.rs
++++ b/vmm/src/api/mod.rs
+@@ -98,6 +98,10 @@ pub enum ApiError {
+     #[error("The VM could not resume")]
+     VmResume(#[source] VmError),
+ 
++    /// The vsock transport reset could not be published.
++    #[error("The vsock transport reset could not be published")]
++    VmVsockReset(#[source] VmError),
++
+     /// The VM is not booted.
+     #[error("The VM is not booted")]
+     VmNotBooted,
+@@ -239,6 +243,19 @@ pub struct VmResizeZoneData {
+     pub desired_ram: u64,
+ }
+ 
++#[derive(Clone, Deserialize, Serialize, Default, Debug)]
++pub struct VmVsockResetData {
++    /// Time to wait for the guest acknowledgement. Defaults to 200 ms.
++    #[serde(default)]
++    pub timeout_ms: Option<u64>,
++}
++
++#[derive(Clone, Deserialize, Serialize, Default, Debug)]
++pub struct VmVsockResetResponse {
++    pub published: bool,
++    pub acked: bool,
++}
++
+ #[derive(Clone, Deserialize, Serialize, Default, Debug)]
+ pub struct VmRemoveDeviceData {
+     pub id: String,
+@@ -297,6 +314,8 @@ pub trait RequestHandler {
+ 
+     fn vm_resume(&mut self) -> Result<(), VmError>;
+ 
++    fn vm_vsock_reset(&mut self, timeout_ms: Option<u64>) -> Result<Option<Vec<u8>>, VmError>;
++
+     fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+ 
+     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
+@@ -1006,6 +1025,43 @@ impl ApiAction for VmPause {
+     }
+ }
+ 
++pub struct VmVsockReset;
++
++impl ApiAction for VmVsockReset {
++    type RequestBody = VmVsockResetData;
++    type ResponseBody = Option<Body>;
++
++    fn request(
++        &self,
++        reset_data: Self::RequestBody,
++        response_sender: Sender<ApiResponse>,
++    ) -> ApiRequest {
++        Box::new(move |vmm| {
++            info!("API request event: VmVsockReset {reset_data:?}");
++
++            let response = vmm
++                .vm_vsock_reset(reset_data.timeout_ms)
++                .map_err(ApiError::VmVsockReset)
++                .map(ApiResponsePayload::VmAction);
++
++            response_sender
++                .send(response)
++                .map_err(VmmError::ApiResponseSend)?;
++
++            Ok(false)
++        })
++    }
++
++    fn send(
++        &self,
++        api_evt: EventFd,
++        api_sender: Sender<ApiRequest>,
++        data: Self::RequestBody,
++    ) -> ApiResult<Self::ResponseBody> {
++        get_response_body(self, api_evt, api_sender, data)
++    }
++}
++
+ pub struct VmPowerButton;
+ 
+ impl ApiAction for VmPowerButton {
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 0f8513e..bac1806 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -4979,6 +4979,18 @@ impl DeviceManager {
+         counters
+     }
+ 
++    /// Ask the vsock device to publish a transport reset while the VM keeps
++    /// running. The device lock is only held long enough to queue the command;
++    /// the caller waits on the returned handle without holding it.
++    pub fn vsock_reset_transport(&self) -> Option<virtio_devices::TransportResetHandle> {
++        let vsock = self.virtio_devices.iter().find(|handle| {
++            handle.virtio_device.lock().unwrap().device_type()
++                == VirtioDeviceType::Vsock as u32
++        })?;
++
++        vsock.virtio_device.lock().unwrap().reset_transport()
++    }
++
+     pub fn resize_balloon(&mut self, size: u64) -> DeviceManagerResult<()> {
+         if let Some(balloon) = &self.balloon {
+             return balloon
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 95b3a86..e3af64b 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -15,6 +15,7 @@ use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
+ use std::sync::{Arc, Mutex};
+ #[cfg(not(target_arch = "riscv64"))]
+ use std::time::Instant;
++use std::time::Duration;
+ use std::{io, result, thread};
+ 
+ use anyhow::anyhow;
+@@ -46,7 +47,7 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+ 
+ use crate::api::{
+     ApiRequest, ApiResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
+-    VmSendMigrationData, VmmPingResponse,
++    VmSendMigrationData, VmVsockResetResponse, VmmPingResponse,
+ };
+ use crate::config::{RestoreConfig, add_to_config};
+ #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+@@ -1720,6 +1721,30 @@ impl RequestHandler for Vmm {
+         }
+     }
+ 
++    fn vm_vsock_reset(
++        &mut self,
++        timeout_ms: Option<u64>,
++    ) -> result::Result<Option<Vec<u8>>, VmError> {
++        const DEFAULT_TIMEOUT_MS: u64 = 200;
++        // Bound the wait so a stuck guest cannot stall the API indefinitely.
++        const MAX_TIMEOUT_MS: u64 = 60_000;
++
++        let timeout = Duration::from_millis(
++            timeout_ms
++                .unwrap_or(DEFAULT_TIMEOUT_MS)
++                .min(MAX_TIMEOUT_MS),
++        );
++        let vm = self.vm.as_ref().ok_or(VmError::VmNotRunning)?;
++        let result = vm.vsock_reset_transport(timeout)?;
++
++        serde_json::to_vec(&VmVsockResetResponse {
++            published: result.published,
++            acked: result.acked,
++        })
++        .map(Some)
++        .map_err(VmError::SerializeJson)
++    }
++
+     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+         if let Some(ref mut vm) = self.vm {
+             // Drain console_info so that FDs are not reused
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index fff0d40..0464a31 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -22,6 +22,7 @@ use std::os::unix::net::UnixStream;
+ use std::sync::{Arc, Mutex};
+ #[cfg(not(target_arch = "riscv64"))]
+ use std::time::Instant;
++use std::time::Duration;
+ use std::{cmp, result, str, thread};
+ 
+ use anyhow::anyhow;
+@@ -2804,6 +2805,32 @@ impl Vm {
+         self.state
+     }
+ 
++    /// Publish a vsock transport reset while the VM is running and wait for
++    /// the guest acknowledgement.
++    ///
++    /// The device manager lock is released before waiting, so the device
++    /// worker can process the command and the API thread does not hold any
++    /// device lock during the timeout window.
++    pub fn vsock_reset_transport(
++        &self,
++        timeout: Duration,
++    ) -> Result<virtio_devices::TransportResetResult> {
++        if self.state != VmState::Running {
++            return Err(Error::VmNotRunning);
++        }
++
++        let handle = {
++            let device_manager = self.device_manager.lock().unwrap();
++            device_manager.vsock_reset_transport()
++        };
++
++        match handle {
++            Some(handle) => Ok(handle.wait(timeout)),
++            // No vsock device: not an error, but nothing was published.
++            None => Ok(virtio_devices::TransportResetResult::default()),
++        }
++    }
++
+     /// Gets the actual size of the balloon.
+     pub fn balloon_size(&self) -> u64 {
+         self.device_manager.lock().unwrap().balloon_size()
+-- 
+2.43.0
+

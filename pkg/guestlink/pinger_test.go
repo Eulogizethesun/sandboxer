@@ -922,3 +922,58 @@ func TestSendQuiesce_WrongResponse(t *testing.T) {
 		t.Error("expected error on wrong response")
 	}
 }
+
+// The restore dial marks are emitted only under KUASAR_PERF=1 (enabled is
+// fixed at package init), so these tests exercise the attempt statistics that
+// feed them instead. fn=restore dials use the existing fake CH proxy.
+func TestDialRawPreRequestContext_AttemptStatsRecover(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	var connects atomic.Uint32
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool {
+		return connects.Add(1) == 1 // first attempt: transient EOF before OK
+	}, func(net.Conn) {})
+	defer proxy.close()
+
+	conn, stats, err := dialRawPreRequestContext(
+		context.Background(), &HostClient{BasePath: base, Logf: t.Logf},
+		2*time.Second, 100*time.Millisecond, "restore", nil)
+	if err != nil {
+		t.Fatalf("dialRawPreRequestContext: %v", err)
+	}
+	_ = conn.Close()
+	if stats.Attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", stats.Attempts)
+	}
+	if stats.Retries != 1 {
+		t.Fatalf("retries = %d, want 1", stats.Retries)
+	}
+	if stats.FirstErr == nil {
+		t.Fatal("first_err = nil, want the first attempt's error")
+	}
+}
+
+func TestDialRawPreRequestContext_AttemptStatsFailure(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "vsock.sock")
+
+	proxy := newFakeCHProxyWithBeforeOK(t, base, func(net.Conn) bool { return true }, func(net.Conn) {})
+	defer proxy.close()
+
+	_, stats, err := dialRawPreRequestContext(
+		context.Background(), &HostClient{BasePath: base, Logf: t.Logf},
+		200*time.Millisecond, 50*time.Millisecond, "restore", nil)
+	if err == nil {
+		t.Fatal("dialRawPreRequestContext error = nil, want bounded failure")
+	}
+	if stats.Attempts < 2 {
+		t.Fatalf("attempts = %d, want at least 2", stats.Attempts)
+	}
+	if stats.Retries != stats.Attempts-1 {
+		t.Fatalf("retries = %d, attempts = %d", stats.Retries, stats.Attempts)
+	}
+	if stats.FirstErr == nil {
+		t.Fatal("first_err = nil, want the first attempt's error")
+	}
+}

@@ -31,8 +31,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -43,6 +43,43 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
+
+// Optional vsock transport reset before freeze (docs/design/vsock-reset-before-freeze.md).
+// When enabled, the snapshot path asks CH to publish a transport reset while
+// the guest is still running and its pages are hot; CH then skips staging the
+// reset at snapshot time. Default off preserves the legacy staging path.
+const (
+	vsockResetBeforeFreezeEnv = "KUASAR_VSOCK_RESET_BEFORE_FREEZE"
+	vsockResetTimeoutEnv      = "KUASAR_VSOCK_RESET_TIMEOUT_MS"
+	defaultVsockResetTimeout  = 200 * time.Millisecond
+)
+
+var (
+	vsockResetBeforeFreeze, vsockResetTimeout = vsockResetSettings(os.Getenv)
+)
+
+func init() {
+	if vsockResetBeforeFreeze {
+		log.Printf("snapshot: vsock reset before freeze enabled (timeout=%s)", vsockResetTimeout)
+		return
+	}
+	log.Printf("snapshot: vsock reset before freeze disabled (CH stages transport reset at snapshot)")
+}
+
+// vsockResetSettings parses the process-start environment. KUASAR_VSOCK_RESET_BEFORE_FREEZE
+// must be exactly "1"; anything else (including unset) keeps the legacy
+// behavior. KUASAR_VSOCK_RESET_TIMEOUT_MS overrides the 200 ms default only
+// when it is a positive integer.
+func vsockResetSettings(getenv func(string) string) (enabled bool, timeout time.Duration) {
+	enabled = getenv(vsockResetBeforeFreezeEnv) == "1"
+	timeout = defaultVsockResetTimeout
+	if raw := strings.TrimSpace(getenv(vsockResetTimeoutEnv)); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+	return enabled, timeout
+}
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
@@ -1918,6 +1955,32 @@ func handleSnapshotRequest(
 	}
 	if mergeMemory {
 		src.MergeBaseSnapshot = memoryMergeBase
+	}
+	// Reset the vsock transport while the guest is still running and its pages
+	// are hot. This is the last step before the snapshot: every fallible
+	// operation has already completed, so a failed /vm.pause cannot leave a
+	// "published but not paused" window. A failure or published=false falls
+	// back to CH's legacy snapshot staging; published without ACK leaves
+	// transport_reset_pending=true so restore gates as today.
+	if vsockResetBeforeFreeze {
+		tReset := time.Now()
+		res, resetErr := (chapi.Client{Sock: chSock, RespDeadline: cfg.CHApiDeadline()}).VsockReset(ctx, vsockResetTimeout)
+		p.Dur("snap.vsock_reset", tReset)
+		p.MarkKV("snap.vsock_reset_result", map[string]any{
+			"published": res.Published,
+			"acked":     res.Acked,
+			"timeout":   res.Published && !res.Acked,
+		})
+		switch {
+		case resetErr != nil:
+			logf("snapshot: vsock transport reset before freeze failed (continuing; CH will stage at snapshot): %v", resetErr)
+		case !res.Published:
+			logf("snapshot: vsock transport reset not published (continuing; CH will stage at snapshot)")
+		case !res.Acked:
+			logf("snapshot: vsock transport reset published but not acknowledged (timeout=true) within %s; continuing (snapshot keeps transport_reset_pending, restore gates)", vsockResetTimeout)
+		default:
+			logf("snapshot: vsock transport reset acknowledged by guest before freeze")
+		}
 	}
 	sinkOpen = false // snapshot.Take owns and closes the sink on every path.
 	tTake := time.Now()

@@ -1,6 +1,7 @@
 package guestlink
 
 import (
+	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,12 @@ import (
 type HostClient struct {
 	BasePath string // /run/<sid>/vsock.sock (NOT the _5000 suffixed one)
 	Logf     func(string, ...any)
+	// SID optionally tags perfmark output with the sandbox id. Restore sets it
+	// before OpenMUXViaRestoreContext so C10 marks attribute to the right
+	// sandbox instead of an empty sid.
+	SID string
+	// Marks optionally receives dial sub-stage durations for stage attribution.
+	Marks *perfmark.Marks
 }
 
 // RoundTrip performs one request/response on a fresh short connection.
@@ -135,8 +142,12 @@ func (c *HostClient) DialRawContext(ctx context.Context, deadline time.Duration)
 		return nil, fmt.Errorf("launchclient: deadline already exceeded")
 	}
 	dialCtx, cancelDial := context.WithTimeout(ctx, remaining)
+	tUnix := time.Now()
 	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", c.BasePath)
 	cancelDial()
+	if c.Marks != nil {
+		c.Marks.Dur("dial.unix", tUnix)
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("launchclient: dial %s: %w", c.BasePath, ctxErr)
@@ -160,11 +171,15 @@ func (c *HostClient) DialRawContext(ctx context.Context, deadline time.Duration)
 		}
 		return nil, err
 	}
+	tOK := time.Now()
 	if _, err := conn.Write(proto.HostConnectLine); err != nil {
 		return fail(fmt.Errorf("launchclient: write CONNECT: %w", err))
 	}
 	if err := drainLine(conn); err != nil {
 		return fail(fmt.Errorf("launchclient: drain OK line: %w", err))
+	}
+	if c.Marks != nil {
+		c.Marks.Dur("dial.connect_ok", tOK)
 	}
 	if !stopCancel() {
 		_ = conn.Close()

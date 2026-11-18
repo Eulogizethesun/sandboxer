@@ -202,3 +202,120 @@ func waitFor(t *testing.T, f func() bool) {
 		t.Fatal("condition not reached")
 	}
 }
+
+// vsockResetRequest captures what the fake CH saw for one VsockReset call.
+type vsockResetRequest struct {
+	method string
+	path   string
+	body   string
+}
+
+func TestVsockReset(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		want          VsockResetResult
+		wantErrSubstr []string
+	}{
+		{
+			name:   "published and acked",
+			status: http.StatusOK,
+			body:   `{"published":true,"acked":true}`,
+			want:   VsockResetResult{Published: true, Acked: true},
+		},
+		{
+			name:   "published without ack",
+			status: http.StatusOK,
+			body:   `{"published":true,"acked":false}`,
+			want:   VsockResetResult{Published: true, Acked: false},
+		},
+		{
+			name:   "not published",
+			status: http.StatusOK,
+			body:   `{"published":false,"acked":false}`,
+			want:   VsockResetResult{Published: false, Acked: false},
+		},
+		{
+			name:          "non-200 carries body text",
+			status:        http.StatusInternalServerError,
+			body:          `device not active`,
+			wantErrSubstr: []string{"non-200", "device not active"},
+		},
+		{
+			name:          "malformed json",
+			status:        http.StatusOK,
+			body:          `{"published":true`,
+			wantErrSubstr: []string{"response JSON"},
+		},
+		{
+			name:          "trailing json value",
+			status:        http.StatusOK,
+			body:          `{"published":true,"acked":true}{}`,
+			wantErrSubstr: []string{"response JSON"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sock := unixSocket(t)
+			observed := make(chan vsockResetRequest, 1)
+			stop := serveUnixHTTP(t, sock, func(conn net.Conn, req *http.Request) {
+				body, _ := io.ReadAll(req.Body)
+				observed <- vsockResetRequest{method: req.Method, path: req.URL.Path, body: string(body)}
+				writeResponse(conn, tt.status, tt.body)
+			})
+			defer stop()
+
+			got, err := (Client{Sock: sock, RespDeadline: time.Second}).VsockReset(context.Background(), 200*time.Millisecond)
+			if len(tt.wantErrSubstr) > 0 {
+				if err == nil {
+					t.Fatalf("VsockReset error = nil, want %v", tt.wantErrSubstr)
+				}
+				for _, sub := range tt.wantErrSubstr {
+					if !strings.Contains(err.Error(), sub) {
+						t.Fatalf("VsockReset error = %v, want substring %q", err, sub)
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("VsockReset: %v", err)
+				}
+				if got != tt.want {
+					t.Fatalf("VsockReset = %+v, want %+v", got, tt.want)
+				}
+			}
+			req := <-observed
+			if req.method != http.MethodPut {
+				t.Fatalf("method = %q, want PUT", req.method)
+			}
+			if req.path != vsockResetPath {
+				t.Fatalf("path = %q, want %q", req.path, vsockResetPath)
+			}
+			if req.body != `{"timeout_ms":200}` {
+				t.Fatalf("body = %q, want timeout_ms=200", req.body)
+			}
+		})
+	}
+}
+
+func TestVsockResetReadsBodyBeyondLegacy4KiBChunk(t *testing.T) {
+	sock := unixSocket(t)
+	// Valid JSON whose body is >4096 bytes. A single 4 KiB read (the legacy
+	// doContext path) would truncate it and fail JSON decoding.
+	body := fmt.Sprintf(`{"published":true,"acked":false,"pad":%q}`, strings.Repeat("x", 5000))
+	if len(body) <= 4096 {
+		t.Fatalf("test body is %d bytes, want >4096", len(body))
+	}
+	stop := serveUnixHTTP(t, sock, func(conn net.Conn, _ *http.Request) {
+		writeResponse(conn, http.StatusOK, body)
+	})
+	defer stop()
+
+	got, err := (Client{Sock: sock, RespDeadline: time.Second}).VsockReset(context.Background(), 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("VsockReset body > 4 KiB: %v", err)
+	}
+	if !got.Published || got.Acked {
+		t.Fatalf("VsockReset = %+v, want published=true acked=false", got)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strconv"
 	"os/exec"
 	"path/filepath"
 	"sync"
@@ -447,6 +448,10 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), snapshotRoot.StateJSON, 0o644); err != nil {
 		return -1, err
 	}
+	if perfmark.Enabled() {
+		// Perf-only diagnostic of the captured vsock epoch; never fails restore.
+		emitRestoreSnapshotState(p, filepath.Join(stateDir, "state.json"), logf)
+	}
 	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), rewritten, 0o644); err != nil {
 		return -1, err
 	}
@@ -686,6 +691,11 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		// don't hand back a sandbox whose guest agent is unreachable.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
 			p.Mark("restore.ch_spawned")
+	if raw := os.Getenv("KUASAR_RESTORE_DIAL_DELAY_MS"); raw != "" {
+		if ms, convErr := strconv.Atoi(raw); convErr == nil && ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+	}
 			tWaitReady := time.Now()
 			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
@@ -699,6 +709,10 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			pc.Logf("VM resumed, vCPU running")
 
 			tRestore := time.Now()
+			// Attribute the guestlink restore marks to this sandbox (C10).
+			if pc.Pinger != nil && pc.Pinger.Client != nil {
+				pc.Pinger.Client.SID = opts.SandboxID
+			}
 			// 0 = no forced timeout: DialRaw needs a finite value, so fall back
 			// to noForcedTimeout (effective-infinity; cancellation still flows
 			// via pc.Ctx → CH teardown closing the vsock conn).
@@ -707,7 +721,8 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 				restoreDeadline = config.NoForcedTimeout
 			}
 			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
-				return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, restoreDeadline)
+				pc.Pinger.Client.Marks = p
+			return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, restoreDeadline)
 			}, pc.EstablishMUX, pc.NotifyReady)
 			if err != nil {
 				return err
