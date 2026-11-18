@@ -720,10 +720,25 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout
 			}
+			var beforeStats map[string]uint64
+			if pc.UffdStats != nil {
+				beforeStats = pc.UffdStats()
+			}
 			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
 				pc.Pinger.Client.Marks = p
-			return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, restoreDeadline)
+				return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, restoreDeadline)
 			}, pc.EstablishMUX, pc.NotifyReady)
+			if pc.UffdStats != nil {
+				if afterStats := pc.UffdStats(); afterStats != nil {
+					delta := map[string]any{}
+					for k, v := range afterStats {
+						if b, ok := beforeStats[k]; ok && v >= b {
+							delta[k] = v - b
+						}
+					}
+					p.MarkKV("restore.uffd_delta", delta)
+				}
+			}
 			if err != nil {
 				return err
 			}
@@ -731,6 +746,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
 			p.Dur("restore.ack", tRestore)
 			p.Mark("restore.ready")
+			if os.Getenv("KUASAR_RESTORE_PROBE") == "1" {
+				probeRestoredVsock(p, pc.CHSock, filepath.Dir(pc.CHSock))
+			}
 			pc.Pinger.Start(pc.Ctx)
 			// Settled is only the node reservation lifecycle fact. Publish it as
 			// soon as ACK + MUX establishes the restored sandbox; it must not be
@@ -1682,4 +1700,36 @@ func fileSnapshotRef(path, rawRef, scheme, digest string, codec tarstream.Codec)
 		return "", err
 	}
 	return ref.String(), nil
+}
+
+// probeRestoredVsock is a test-only diagnostic: after the MUX is ready it
+// opens two more host-initiated connections to the guest listener and one to a
+// port with no listener, so the stage marks show whether the first-connect
+// cost is a one-off warm-up or per-connection.
+func probeRestoredVsock(p *perfmark.Marks, chSock, runDir string) {
+	if p == nil {
+		return
+	}
+	sock := filepath.Join(runDir, "vsock.sock")
+	probe := func(name string, line []byte) {
+		t := time.Now()
+		conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+		if err != nil {
+			p.MarkKV(name+".err", map[string]any{"err": err.Error()})
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write(line); err != nil {
+			p.MarkKV(name+".err", map[string]any{"err": err.Error()})
+			return
+		}
+		buf := make([]byte, 64)
+		n, _ := conn.Read(buf)
+		p.Dur(name, t)
+		p.MarkKV(name+".resp", map[string]any{"resp": string(buf[:n])})
+	}
+	probe("probe.conn5000_2", proto.HostConnectLine)
+	probe("probe.conn5000_3", proto.HostConnectLine)
+	probe("probe.absent5999", append([]byte("CONNECT 5999"), byte(10)))
 }

@@ -90,6 +90,9 @@ type PostSpawnCtx struct {
 	CHSock       string
 	Logf         func(string, ...any)
 	NotifyReady  func()
+	// UffdStats optionally exposes the UFFD handler counters so PostSpawn
+	// callers can attribute a window (e.g. the restore dial) to page faults.
+	UffdStats func() map[string]uint64
 }
 
 // VMParams is the input to ServeAndWait — everything the shared
@@ -1196,6 +1199,12 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	})
 
+	uffdStats := func() map[string]uint64 {
+		if uffdHandler == nil {
+			return nil
+		}
+		return uffdHandler.Stats()
+	}
 	if err := p.PostSpawn(PostSpawnCtx{
 		Ctx:          postSpawnCtx,
 		Cmd:          cmd,
@@ -1207,6 +1216,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		CHSock:       chSock,
 		Logf:         logf,
 		NotifyReady:  notifyReady,
+		UffdStats:    uffdStats,
 	}); err != nil {
 		if readFatal() != nil || !runShutdownRequested(p.Ctx) {
 			_ = cmd.Process.Kill()
