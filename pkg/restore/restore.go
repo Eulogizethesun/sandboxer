@@ -34,6 +34,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -123,6 +124,8 @@ func (opts Options) openFile(ctx context.Context, path string, ref manifest.Ref)
 
 // Run executes restore. Returns the CH exit code.
 func Run(ctx context.Context, opts Options) (code int, retErr error) {
+	p := perfmark.Start("runtime", "resume").SID(opts.SandboxID)
+	p.Mark("restore.begin")
 	if opts.SnapshotPath == "" && opts.SnapshotManifestKey == "" {
 		return -1, errors.New("restore: SnapshotPath or SnapshotManifestKey required")
 	}
@@ -187,6 +190,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("open snapshot: %w", err)
 	}
+	p.Mark("restore.open")
 	opts = root.opts
 	snapshotRoot, err := snapshotfile.Open(ctx, root.stream)
 	if err != nil {
@@ -503,6 +507,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, fmt.Errorf("snapshot source: %w", err)
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
+	p.Mark("restore.memory_source")
 	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, root.stream, len(memLayers)-1, logf)
 	// Close is a lifetime boundary for fetch.Stream. Register this after every
 	// memory-layer Close defer so cancellation and join always run first.
@@ -532,6 +537,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			code = -1
 		}
 	}()
+	p.Mark("restore.disks")
 	if opts.CurrentRun != nil {
 		if !opts.EnableCheckpoint || opts.CurrentRun.SandboxID != opts.SandboxID {
 			return -1, errors.New("current disk retention requires checkpoint mode and matching sandbox identity")
@@ -679,12 +685,17 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		// non-nil return aborts the run (ServeAndWait kills CH); we
 		// don't hand back a sandbox whose guest agent is unreachable.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
+			p.Mark("restore.ch_spawned")
+			tWaitReady := time.Now()
 			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
+			p.Dur("restore.api_ready", tWaitReady)
+			tResume := time.Now()
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
 			}
+			p.Dur("restore.vm_resume", tResume)
 			pc.Logf("VM resumed, vCPU running")
 
 			tRestore := time.Now()
@@ -703,6 +714,8 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			}
 			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
+			p.Dur("restore.ack", tRestore)
+			p.Mark("restore.ready")
 			pc.Pinger.Start(pc.Ctx)
 			// Settled is only the node reservation lifecycle fact. Publish it as
 			// soon as ACK + MUX establishes the restored sandbox; it must not be

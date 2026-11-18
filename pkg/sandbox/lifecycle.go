@@ -31,6 +31,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
@@ -1468,6 +1469,8 @@ func handleSnapshotRequest(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	p := perfmark.Start("runtime", "pause").SID(opts.SandboxID)
+	p.Mark("snap.recv")
 	req, err = prepareNamedCapture(req, opts, disks)
 	if err != nil {
 		return ctl.Response{}, err
@@ -1524,6 +1527,7 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot: runtime disk count %d does not match configured disk count %d",
 			len(disks), 1+len(opts.Cfg.Boot.Disks))
 	}
+	p.Mark("snap.validate")
 	var bundleSink *snapshot.BundleSink
 	var bundleAdmission store.WriteAdmission
 
@@ -1561,6 +1565,7 @@ func handleSnapshotRequest(
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: memory history: %w", err)
 	}
+	p.Mark("snap.history")
 	defer func() { err = errors.Join(err, history.Close()) }()
 	resultMemoryRefs := history.refs
 	mergeMemory, memoryMergeBase := history.base != "", history.base
@@ -1638,6 +1643,7 @@ func handleSnapshotRequest(
 	if err != nil || planCloseErr != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot dependencies: %w", errors.Join(err, planCloseErr))
 	}
+	p.Mark("snap.deps")
 
 	cfg := opts.Cfg
 	var historicalRef string
@@ -1769,6 +1775,7 @@ func handleSnapshotRequest(
 			return ctl.Response{}, fmt.Errorf("snapshot: drain VMM memory.high throttles: %w", drainErr)
 		}
 	}
+	p.Mark("snap.membarrier")
 
 	dropCachesResult := proto.DropCachesUnknown
 	guestQuiesced := false
@@ -1836,7 +1843,9 @@ func handleSnapshotRequest(
 		client = pinger.Client
 	}
 	guestRecoveryRequired = true
+	tQuiesce := time.Now()
 	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
+	p.Dur("snap.quiesce", tQuiesce)
 	if qerr != nil {
 		if forwarderNeedsAbort {
 			forwarder.AbortAndDrain()
@@ -1911,7 +1920,15 @@ func handleSnapshotRequest(
 		src.MergeBaseSnapshot = memoryMergeBase
 	}
 	sinkOpen = false // snapshot.Take owns and closes the sink on every path.
+	tTake := time.Now()
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
+	p.Dur("snap.take", tTake)
+	if err == nil {
+		p.MarkKV("snap.take_result", map[string]any{
+			"pause_ms": out.WallclockPauseMs,
+			"dump_ms":  out.WallclockDumpMs,
+		})
+	}
 	if err != nil {
 		// SendQuiesce closes the old MUX and freezes the application. Take
 		// restores the VM/backend state on failure; reattach completes the
@@ -1958,6 +1975,7 @@ func handleSnapshotRequest(
 		resp.SnapshotPath = out.SnapshotPath
 		resp.OverlayPath = out.SandboxPath
 		resp.OverlayRef = out.SandboxRef
+		p.Mark("snap.end")
 		return resp, nil
 	}
 

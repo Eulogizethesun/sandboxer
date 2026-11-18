@@ -24,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 )
 
 // Quiescer abstracts the vhost backend's pause/resume hooks. A typical
@@ -139,6 +140,8 @@ type Outputs struct {
 // sink (FileSink for --output, IngestSink for --upload, or BundleSink). Take
 // closes it on every return path.
 func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr error) {
+	pm := perfmark.Start("runtime", "snapshot-take").SID(s.SandboxID)
+	pm.Mark("take.begin")
 	checkpointState := &checkpointCapture{id: s.CheckpointID}
 	defer func() { retErr = errors.Join(retErr, checkpointState.close()) }()
 	sinkOpen := sink != nil
@@ -222,6 +225,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, fmt.Errorf("CH pause: %w", err)
 	}
 	pausedAt := time.Now()
+	pm.Dur("vmm.pause", pauseStart)
 	resumed := false
 	succeeded := false
 	defer func() {
@@ -248,8 +252,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	// T3: capture all disks once and emit Sandbox E while the same CH/backend
 	// freeze remains held. E is a dependency, not yet the operation root.
 	dumpStart := time.Now()
-	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
-		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
+	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
 		SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
 		ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
 		LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
@@ -259,6 +262,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, err
 	}
 	out.SandboxRef, out.SandboxPath = sandboxOut.SandboxRef, sandboxOut.SandboxPath
+	pm.Dur("take.disk", dumpStart)
 
 	// T4: CH /vm.snapshot → staging dir. CH writes only config.json + state.json
 	// there (small); the multi-GiB memory + disk never touch the staging tmpfs —
@@ -274,6 +278,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err != nil {
 		return nil, fmt.Errorf("read state.json: %w", err)
 	}
+	pm.Mark("take.ch_snapshot")
 
 	// T5: the memory-only snapshot.cfg points at E and carries only the memory
 	// parent chain.
@@ -323,6 +328,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if workingMemory == nil {
 		workingMemory = memorySource
 	}
+	pm.Mark("take.mem_capture")
 	fallbackCoverage := DataCoverage(workingMemory)
 	fallbackValues := workingMemory
 	if s.MemoryFallbackBase != nil {
@@ -359,6 +365,8 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, fmt.Errorf("build Snapshot S: %w", err)
 	}
 	out.MemoryResident = storage.DataBytes + storage.ZeroBytes
+	pm.Mark("take.mem_build")
+	tCommit := time.Now()
 	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, snapshotSource)
 	var memoryBaseCloseErr error
 	if memoryBaseOpen {
@@ -368,6 +376,8 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err != nil || memoryBaseCloseErr != nil {
 		return nil, fmt.Errorf("absorb Snapshot S: %w", errors.Join(err, memoryBaseCloseErr))
 	}
+	pm.Dur("take.mem_absorb", tCommit)
+	tFinish := time.Now()
 	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
@@ -388,6 +398,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if closeErr != nil {
 		return nil, closeErr
 	}
+	pm.Dur("take.commit", tFinish)
 	dumpEnd := time.Now()
 
 	// T8: resume (destroy path handled by caller).
@@ -402,6 +413,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 
 	out.WallclockPauseMs = pausedAt.Sub(pauseStart).Milliseconds()
 	out.WallclockDumpMs = dumpEnd.Sub(dumpStart).Milliseconds()
+	pm.MarkKV("take.end", map[string]any{"pause_ms": out.WallclockPauseMs, "dump_ms": out.WallclockDumpMs})
 	logf("snapshot: sandbox=%s snapshot=%s memory_resident=%d", out.SandboxRef, out.SnapshotRef, out.MemoryResident)
 	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
