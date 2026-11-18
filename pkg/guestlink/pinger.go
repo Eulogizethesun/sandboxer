@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
@@ -393,7 +394,10 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	pm := perfmark.Start("guestlink", "restore")
+	tDial := time.Now()
 	conn, err := dialRawForRestoreContext(ctx, client, deadline, restoreDialAttemptTimeout)
+	pm.Dur("restore.dial", tDial)
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
@@ -403,12 +407,14 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 	// CH reloads the snapshot's stale clock. Capture after connecting, near
 	// the send; this does not bound propagation or guest scheduling delay.
 	rawConn := conn
+	tAck := time.Now()
 	resultConn, spec, err := finishOpenMUX(rawConn, &proto.Message{
 		Type:        proto.TypeRestore,
 		Epoch:       epoch,
 		WallclockNs: time.Now().UnixNano(),
 		Network:     network,
 	}, proto.TypeRestoreAck)
+	pm.Dur("restore.guest_ack", tAck)
 	if !stopCancel() {
 		_ = rawConn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
