@@ -209,6 +209,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if string(canonicalSnapshotConfig) != string(snapshotRoot.SnapshotConfig) {
 		return -1, errors.New("snapshot.cfg is not canonically encoded")
 	}
+	p.Mark("restore.meta_s")
 
 	sandboxSource, err := openReferencedSandbox(ctx, memoryConfig.SandboxRef, opts)
 	if err != nil {
@@ -227,6 +228,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}
 	}()
 	opts.ArtifactRelativeDir = sandboxSource.RelativeDir
+	p.Mark("restore.meta_e")
 	sourcebind.ApplyDefaultBootBindings(opts.HostCfg, sandboxSource.Root.Portable, sandboxSource.RelativeDir)
 	merged, c0, err := config.ApplyRestoreRules(sandboxSource.Root.Portable, opts.HostCfg, opts.HostPresence)
 	if err != nil {
@@ -251,6 +253,14 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("Sandbox source binding: %w", err)
 	}
+	p.Mark("restore.meta_rules")
+
+	// CH snapshot config is the Capacity authority; resolve it before the disk
+	// preflight so the parent memory layers can open concurrently with it.
+	snapCap, err := chmemory.CapacityFromVMConfig(snapshotRoot.ConfigJSON)
+	if err != nil {
+		return -1, fmt.Errorf("snapshot CH capacity: %w", err)
+	}
 
 	if opts.EnableCheckpoint {
 		bases, err := c0.Checkpointed(sandboxSource.PortableRef)
@@ -262,9 +272,60 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			return -1, err
 		}
 	}
-	if err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey); err != nil {
+	// Parent memory layers are independent of the disk graph; open them while
+	// the disk preflight runs, then join before the UFFD source is built.
+	type parentLayersResult struct {
+		layers []fetch.Stream
+		err    error
+	}
+	parentCtx, cancelParents := context.WithCancel(ctx)
+	defer cancelParents()
+	parentLayersCh := make(chan parentLayersResult, 1)
+	parentOpts := opts
+	go func() {
+		layers, parentErr := openMemoryParentLayers(parentCtx, memoryConfig.FromRefs, parentOpts, snapCap)
+		parentLayersCh <- parentLayersResult{layers: layers, err: parentErr}
+	}()
+	var parents parentLayersResult
+	parentsReceived := false
+	receiveParents := func() parentLayersResult {
+		if !parentsReceived {
+			parents = <-parentLayersCh
+			parentsReceived = true
+		}
+		return parents
+	}
+	defer func() {
+		if parentsReceived {
+			return
+		}
+		// An error between the preflight and the join must still reap the
+		// parent layers opened in the background.
+		cancelParents()
+		orphan := receiveParents()
+		if orphan.err == nil {
+			for _, layer := range orphan.layers {
+				_ = layer.Close()
+			}
+		}
+	}()
+	diskCache := newRestoreDiskCache()
+	defer func() {
+		if closeErr := diskCache.Close(); closeErr != nil {
+			retErr = errors.Join(retErr, closeErr)
+			code = -1
+		}
+	}()
+	if err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey, diskCache); err != nil {
+		cancelParents()
+		if drained := receiveParents(); drained.err == nil {
+			for _, layer := range drained.layers {
+				_ = layer.Close()
+			}
+		}
 		return -1, fmt.Errorf("restore disk graph preflight: %w", err)
 	}
+	p.Mark("restore.meta_preflight")
 
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
 	startUnixNs := time.Now().UnixNano()
@@ -344,10 +405,6 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err := validateSnapshotVCPUTopology(snapshotRoot.ConfigJSON, snapCfg.Resources.Capacity.CPU); err != nil {
 		return -1, err
 	}
-	snapCap, err := chmemory.CapacityFromVMConfig(snapshotRoot.ConfigJSON)
-	if err != nil {
-		return -1, fmt.Errorf("snapshot CH capacity: %w", err)
-	}
 	if err := validateMemoryMapping(snapshotRoot.ConfigJSON, snapshotRoot.StateJSON, snapCap); err != nil {
 		return -1, err
 	}
@@ -396,10 +453,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// cgroup, controller lease, network provider, memfd, or VM state. Keep these
 	// exact streams for the later UFFD chain so validation and use cannot race a
 	// second lookup of the same ref.
-	parentMemoryLayers, err := openMemoryParentLayers(ctx, memoryConfig.FromRefs, opts, snapCap)
-	if err != nil {
-		return -1, err
+	parentsResult := receiveParents()
+	if parentsResult.err != nil {
+		return -1, parentsResult.err
 	}
+	parentMemoryLayers := parentsResult.layers
+	p.Mark("restore.meta_parents")
 	defer func() {
 		for i := len(parentMemoryLayers) - 1; i >= 0; i-- {
 			if closeErr := parentMemoryLayers[i].Close(); closeErr != nil {
@@ -433,6 +492,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("rewrite config.json: %w", err)
 	}
+	p.Mark("restore.meta_rewrite")
 	identity, err := runidentity.Acquire(runDir, opts.SandboxID)
 	if err != nil {
 		return -1, fmt.Errorf("restore runtime identity: %w", err)
@@ -455,6 +515,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), rewritten, 0o644); err != nil {
 		return -1, err
 	}
+	p.Mark("restore.meta_write")
 
 	// Cgroup setup must use the resolved snapshot Capacity, not a host-only
 	// preflight value. memory.high remains max until the first trusted report.
@@ -532,7 +593,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			code = -1
 		}
 	}()
-	disks, cleanupDisks, err := reconstructRestoreDisks(ctx, opts, diffCustomerKey, &snapCfg, logf, cowCache)
+	disks, cleanupDisks, err := reconstructRestoreDisks(ctx, opts, diffCustomerKey, &snapCfg, logf, cowCache, diskCache)
+	// Release preflight readers the reconstruction did not claim (pure disks,
+	// duplicate layers); claimed readers are owned by the disk backends.
+	if closeErr := diskCache.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return -1, err
 	}
@@ -811,7 +877,7 @@ func openAndEstablishRestoreMUX(
 // pins must survive every writer open, including a failure on the last disk.
 // Only after all writers and their cleanups are registered may they be released.
 // Disk provenance comes from E/C0; S contributes no disk fields.
-func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cfg *config.SandboxConfig, logf func(string, ...any), cache *diffstore.Cache) (_ []sandbox.DiskBackend, cleanup func() error, retErr error) {
+func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cfg *config.SandboxConfig, logf func(string, ...any), cache *diffstore.Cache, diskCache *restoreDiskCache) (_ []sandbox.DiskBackend, cleanup func() error, retErr error) {
 	var closes []func() error
 	cleanup = sync.OnceValue(func() error {
 		var err error
@@ -850,7 +916,7 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 			continue
 		}
 		pure := i > 0 && cfg.Boot.Disks[i-1].PureBlock
-		disk, closeDisk, err := reconstructDisk(ctx, opts, key, single, top, chain, root.Base, diffURI, diffTemplate, diskKey, logf, cache, pure)
+		disk, closeDisk, err := reconstructDisk(ctx, opts, key, single, top, chain, root.Base, diffURI, diffTemplate, diskKey, logf, cache, diskCache, pure)
 		disk.Slot = i > 0 && cfg.Boot.Disks[i-1].Slot != nil
 		if err != nil {
 			return nil, cleanup, err
@@ -877,7 +943,7 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 // diffURI/diffTemplate come from the restore host binding (or the auto-default
 // <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache, pure ...bool) (sandbox.DiskBackend, func() error, error) {
+func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache, diskCache *restoreDiskCache, pure ...bool) (sandbox.DiskBackend, func() error, error) {
 	var db sandbox.DiskBackend
 	var closers []func() error
 	cleanup := func() error {
@@ -898,17 +964,22 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	var baseReader diffstore.BlockReader
 	var err error
 	if capturedTop != "" {
-		if len(pure) > 0 && pure[0] {
-			if opts.storage == nil {
-				return fail(errors.New("pure disk restore requires process storage"))
+		// The preflight validated these exact layers and cached the reader;
+		// reuse it instead of reopening every artifact.
+		baseReader = diskCache.takeBase(diskKey)
+		if baseReader == nil {
+			if len(pure) > 0 && pure[0] {
+				if opts.storage == nil {
+					return fail(errors.New("pure disk restore requires process storage"))
+				}
+				source := config.DiskV1{Kind: "disk", Version: 1, Base: capturedTop, BaseFromRefs: chain}
+				baseReader, _, _, err = sandbox.OpenDiskV1Source(ctx, source, opts.storage, opts.RefLocations)
+			} else {
+				baseReader, err = openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) { return openDiskRefStream(ctx, raw, opts) })
 			}
-			source := config.DiskV1{Kind: "disk", Version: 1, Base: capturedTop, BaseFromRefs: chain}
-			baseReader, _, _, err = sandbox.OpenDiskV1Source(ctx, source, opts.storage, opts.RefLocations)
-		} else {
-			baseReader, err = openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) { return openDiskRefStream(ctx, raw, opts) })
-		}
-		if err != nil {
-			return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
+			if err != nil {
+				return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
+			}
 		}
 		closers = append(closers, baseReader.Close)
 	} else if opts.checkpointPlan == nil || len(opts.checkpointReopen) == 0 {
@@ -968,9 +1039,13 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 
 	// Overlay mode: the ro erofs base device.
 	if !single {
-		r, _, rerr := openEROFSBlockReader(ctx, erofsBaseURI, opts)
-		if rerr != nil {
-			return fail(fmt.Errorf("%s: open erofs base: %w", diskKey, rerr))
+		r := diskCache.takeEROFS(erofsBaseURI)
+		if r == nil {
+			var rerr error
+			r, _, rerr = openEROFSBlockReader(ctx, erofsBaseURI, opts)
+			if rerr != nil {
+				return fail(fmt.Errorf("%s: open erofs base: %w", diskKey, rerr))
+			}
 		}
 		db.Reader, db.BasePath = r, erofsBaseURI
 		closers = append(closers, r.Close)
@@ -1326,7 +1401,90 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 	return source, nil
 }
 
-func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte) error {
+// restoreDiskCache carries the readers opened by the preflight into the disk
+// reconstruction so each artifact is opened once instead of two or three
+// times. Entries are transferred out (take*) as their owner claims them; any
+// leftovers are closed by Close.
+type restoreDiskCache struct {
+	streams map[string]fetch.Stream
+	bases   map[string]diffstore.BlockReader
+	erofs   map[string]diffstore.BlockReader
+}
+
+func newRestoreDiskCache() *restoreDiskCache {
+	return &restoreDiskCache{
+		streams: make(map[string]fetch.Stream),
+		bases:   make(map[string]diffstore.BlockReader),
+		erofs:   make(map[string]diffstore.BlockReader),
+	}
+}
+
+func (c *restoreDiskCache) putStream(ref string, stream fetch.Stream) {
+	if c != nil && stream != nil {
+		c.streams[ref] = stream
+	}
+}
+
+func (c *restoreDiskCache) takeStream(ref string) fetch.Stream {
+	if c == nil {
+		return nil
+	}
+	stream := c.streams[ref]
+	delete(c.streams, ref)
+	return stream
+}
+
+func (c *restoreDiskCache) putBase(diskKey string, reader diffstore.BlockReader) {
+	if c != nil && reader != nil {
+		c.bases[diskKey] = reader
+	}
+}
+
+func (c *restoreDiskCache) takeBase(diskKey string) diffstore.BlockReader {
+	if c == nil {
+		return nil
+	}
+	reader := c.bases[diskKey]
+	delete(c.bases, diskKey)
+	return reader
+}
+
+func (c *restoreDiskCache) putEROFS(ref string, reader diffstore.BlockReader) {
+	if c != nil && reader != nil {
+		c.erofs[ref] = reader
+	}
+}
+
+func (c *restoreDiskCache) takeEROFS(ref string) diffstore.BlockReader {
+	if c == nil {
+		return nil
+	}
+	reader := c.erofs[ref]
+	delete(c.erofs, ref)
+	return reader
+}
+
+func (c *restoreDiskCache) Close() error {
+	if c == nil {
+		return nil
+	}
+	var err error
+	for ref, stream := range c.streams {
+		err = errors.Join(err, stream.Close())
+		delete(c.streams, ref)
+	}
+	for key, reader := range c.bases {
+		err = errors.Join(err, reader.Close())
+		delete(c.bases, key)
+	}
+	for ref, reader := range c.erofs {
+		err = errors.Join(err, reader.Close())
+		delete(c.erofs, ref)
+	}
+	return err
+}
+
+func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte, cache *restoreDiskCache) error {
 	if cfg == nil {
 		return errors.New("nil restored Sandbox config")
 	}
@@ -1345,9 +1503,9 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			return 0, fmt.Errorf("%s: %w", field, err)
 		}
 		size := stream.Size()
-		if closeErr := stream.Close(); closeErr != nil {
-			return 0, fmt.Errorf("%s close: %w", field, closeErr)
-		}
+		// Keep the handle for the later layered/COW open instead of reopening
+		// the same artifact; the cache owner closes it if it goes unused.
+		cache.putStream(raw, stream)
 		seen[raw] = size
 		return size, nil
 	}
@@ -1362,9 +1520,9 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		if err != nil {
 			return 0, fmt.Errorf("%s: %w", field, err)
 		}
-		if closeErr := reader.Close(); closeErr != nil {
-			return 0, fmt.Errorf("%s close: %w", field, closeErr)
-		}
+		// The reconstruction opens the same EROFS base for the block device;
+		// hand it the already-open reader instead of reopening.
+		cache.putEROFS(raw, reader)
 		seenImages[raw] = uint64(size)
 		return uint64(size), nil
 	}
@@ -1401,9 +1559,13 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			return nil, cause
 		}
 		for i, raw := range refs {
-			stream, err := openDiskRefStream(ctx, raw, opts)
-			if err != nil {
-				return fail(fmt.Errorf("%s layer[%d]: %w", field, i, err))
+			stream := cache.takeStream(raw)
+			if stream == nil {
+				var openErr error
+				stream, openErr = openDiskRefStream(ctx, raw, opts)
+				if openErr != nil {
+					return fail(fmt.Errorf("%s layer[%d]: %w", field, i, openErr))
+				}
 			}
 			if i == 0 {
 				logicalSize = stream.Size()
@@ -1439,7 +1601,9 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			return err
 		}
 		if base != nil {
-			defer func() { retErr = errors.Join(retErr, base.Close()) }()
+			// Ownership moves to the cache so the reconstruction reuses this
+			// layered reader instead of reopening every layer.
+			cache.putBase(diskKey, base)
 		}
 		if diffURI == "" {
 			diffURI = sandbox.DefaultDiskDiffURI(
