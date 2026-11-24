@@ -661,6 +661,17 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		logf("tapfd: received tap fd for restore (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, netnsFile != nil)
 	}
 	netMAC, netSpec := snapCfg.Network.Effective(metaMAC, metaIP)
+	// The snapshot's guest already carries this network. Pushing an identical
+	// spec would only make the guest re-derive hostname/address/MTU/route
+	// before ACK (a variable 5-30ms of first-touch syscalls after restore), so
+	// omit it when nothing changed. A genuinely different identity still gets
+	// the full flush-and-replace path.
+	if !snapCfg.Network.NeedsGuestApply(netSpec) {
+		if netSpec != nil {
+			logf("restore: guest network already matches the snapshot; omitting NetworkSpec")
+		}
+		netSpec = nil
+	}
 
 	// The shared back-half (memfd, uffd va_report handler, vhost-blk
 	// backends, the launch server — incl. the guest→host mem_report /

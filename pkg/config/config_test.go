@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 	"gopkg.in/yaml.v3"
 )
@@ -1270,6 +1271,47 @@ func TestSchemeAndPath(t *testing.T) {
 		if s != c.scheme || v != c.val || ok != c.ok {
 			t.Errorf("SchemeAndPath(%q) = (%q, %q, %v), want (%q, %q, %v)",
 				c.uri, s, v, ok, c.scheme, c.val, c.ok)
+		}
+	}
+}
+
+func TestNeedsGuestApply(t *testing.T) {
+	base := NetworkConfig{
+		Interface: "eth0",
+		IP:        "169.254.0.21/30",
+		MTU:       1500,
+		Nexthop:   "169.254.0.22",
+		Hostname:  "sbx",
+	}
+	spec := func(mut func(*proto.NetworkSpec)) *proto.NetworkSpec {
+		s := &proto.NetworkSpec{
+			Interface: "eth0",
+			IPCIDR:    "169.254.0.21/30",
+			MTU:       1500,
+			Nexthop:   "169.254.0.22",
+			Hostname:  "sbx",
+		}
+		mut(s)
+		return s
+	}
+	for _, tc := range []struct {
+		name string
+		n    NetworkConfig
+		spec *proto.NetworkSpec
+		want bool
+	}{
+		{"nil spec", base, nil, false},
+		{"identical", base, spec(func(*proto.NetworkSpec) {}), false},
+		{"empty interface equals eth0", NetworkConfig{IP: "169.254.0.21/30", MTU: 1500, Nexthop: "169.254.0.22", Hostname: "sbx"}, spec(func(*proto.NetworkSpec) {}), false},
+		{"different address", base, spec(func(s *proto.NetworkSpec) { s.IPCIDR = "169.254.0.25/30" }), true},
+		{"different prefix", base, spec(func(s *proto.NetworkSpec) { s.IPCIDR = "169.254.0.21/29" }), true},
+		{"different mtu", base, spec(func(s *proto.NetworkSpec) { s.MTU = 9000 }), true},
+		{"different nexthop", base, spec(func(s *proto.NetworkSpec) { s.Nexthop = "169.254.0.26" }), true},
+		{"different hostname", base, spec(func(s *proto.NetworkSpec) { s.Hostname = "other" }), true},
+		{"different interface", base, spec(func(s *proto.NetworkSpec) { s.Interface = "ens3" }), true},
+	} {
+		if got := tc.n.NeedsGuestApply(tc.spec); got != tc.want {
+			t.Errorf("%s: NeedsGuestApply = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
