@@ -502,8 +502,54 @@ func (n NetworkConfig) Effective(metaMAC, metaIP string) (mac string, spec *prot
 	}
 }
 
-// mergeIPMask returns metaIP unchanged if it already carries a prefix;
-// otherwise it appends the configured CIDR's mask (preserving the operator's
+// NeedsGuestApply reports whether spec asks the restored guest to change any
+// field its restore comparison checks, relative to n — the configuration the
+// snapshot was taken with. A spec derived from n with no identity change is
+// redundant: pushing it makes the guest re-derive hostname/address/MTU/route
+// after restore, which costs a variable 5-30ms of first-touch syscalls before
+// it can ACK. A nil spec ("no IP to configure") never needs a push.
+func (n NetworkConfig) NeedsGuestApply(spec *proto.NetworkSpec) bool {
+	if spec == nil {
+		return false
+	}
+	if guestInterfaceName(n.Interface) != guestInterfaceName(spec.Interface) {
+		return true
+	}
+	if !sameCIDR(n.IP, spec.IPCIDR) {
+		return true
+	}
+	if n.MTU != spec.MTU || n.Nexthop != spec.Nexthop || n.Hostname != spec.Hostname {
+		return true
+	}
+	return false
+}
+
+// guestInterfaceName mirrors the guest's default: an empty interface name
+// means eth0.
+func guestInterfaceName(name string) string {
+	if name == "" {
+		return "eth0"
+	}
+	return name
+}
+
+// sameCIDR compares two CIDR strings by address and prefix length; equal
+// strings are equal even if either fails to parse.
+func sameCIDR(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ipA, netA, errA := net.ParseCIDR(a)
+	ipB, netB, errB := net.ParseCIDR(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	onesA, _ := netA.Mask.Size()
+	onesB, _ := netB.Mask.Size()
+	return ipA.Equal(ipB) && onesA == onesB
+}
+
+// mergeIPMask returns metaIP unchanged if it already carries a prefix;// otherwise it appends the configured CIDR's mask (preserving the operator's
 // prefix), falling back to /32 (IPv4) or /128 (IPv6) when none is available.
 func mergeIPMask(metaIP, cfgIP string) string {
 	if strings.Contains(metaIP, "/") {
