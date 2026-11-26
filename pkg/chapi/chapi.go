@@ -31,7 +31,13 @@ const dialTimeout = 5 * time.Second
 const (
 	waitReadyDialTimeout = 50 * time.Millisecond
 	waitReadyInitialPoll = 1 * time.Millisecond
-	waitReadyMaxPoll     = 20 * time.Millisecond
+	// waitReadyMaxPoll caps the exponential backoff between vm.info probes.
+	// Probes are read-only local UDS round trips that CH's single API event
+	// loop absorbs sequentially, so the backoff buys nothing but detection
+	// latency: with a 20ms cap, a restore completing between probes waited
+	// up to 16ms past actual readiness. A 2ms cap bounds that wait to 2ms
+	// (~9 probes over a 15ms restore window).
+	waitReadyMaxPoll     = 2 * time.Millisecond
 	maxReadyResponseBody = 1 << 20
 
 	// maxBodyResponseBytes bounds the read-until-EOF response variant used by
