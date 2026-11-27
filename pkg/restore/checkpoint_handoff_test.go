@@ -62,7 +62,7 @@ func restoreHandoffPlan(t *testing.T, opts Options, source *openedSandboxSource)
 			t.Fatal(err)
 		}
 	}
-	if err := preflightRestoreDiskGraph(context.Background(), cfg, opts, source.RelativeDir, key); err != nil {
+	if err := preflightRestoreDiskGraph(context.Background(), cfg, opts, source.RelativeDir, key, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	var paths []string
@@ -116,7 +116,7 @@ func TestRestoreCheckpointSourcesHandOffAfterEveryWriter(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer cache.Close()
-			disks, cleanup, err := reconstructRestoreDisks(ctx, opts, key, cfg, func(string, ...any) {}, cache)
+			disks, cleanup, err := reconstructRestoreDisks(ctx, opts, key, cfg, func(string, ...any) {}, cache, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -214,7 +214,7 @@ func TestRestoreCheckpointFailedHandoffCleansEveryWriter(t *testing.T) {
 					cancel() // The root writer has already opened.
 				}
 			}
-			_, cleanup, err := reconstructRestoreDisks(ctx, opts, key, cfg, logf, cache)
+			_, cleanup, err := reconstructRestoreDisks(ctx, opts, key, cfg, logf, cache, nil)
 			if err == nil {
 				t.Fatal("failed handoff succeeded")
 			}
