@@ -59,7 +59,11 @@ func TestRunMemoryRestoreDoesNotRequireExternalKernel(t *testing.T) {
 			}
 			sLogical, err := snapshotfile.BuildSource(
 				sparse.Dense(bytes.NewReader(make([]byte, 4096)), 4096),
-				[]byte(`{"cpus":{"boot_vcpus":2,"max_vcpus":2}}`), []byte("{}"), sConfig,
+				// The CH config carries a memory section because the capacity
+				// parse is hoisted ahead of the topology guard: without it the
+				// run would stop at "snapshot CH capacity" instead of the
+				// kernel-independent topology failure this test pins.
+				[]byte(`{"cpus":{"boot_vcpus":2,"max_vcpus":2},"memory":{"size":4096}}`), []byte("{}"), sConfig,
 			)
 			if err != nil {
 				t.Fatal(err)

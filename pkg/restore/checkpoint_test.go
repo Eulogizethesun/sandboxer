@@ -131,7 +131,7 @@ func TestRestoreCheckpointSameDirectoryUsesPlanAndRealDIFF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := preflightRestoreDiskGraph(ctx, cfg, opts, source.RelativeDir, [32]byte{}); err != nil {
+	if err := preflightRestoreDiskGraph(ctx, cfg, opts, source.RelativeDir, [32]byte{}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	cache, err := diffstore.NewCache(8192, 4096)
@@ -139,7 +139,7 @@ func TestRestoreCheckpointSameDirectoryUsesPlanAndRealDIFF(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cache.Close()
-	db, closeDisk, err := reconstructDisk(ctx, opts, [32]byte{}, true, "", nil, "", cfg.Boot.Root.Diff, "", "overlay", func(string, ...any) {}, cache)
+	db, closeDisk, err := reconstructDisk(ctx, opts, [32]byte{}, true, "", nil, "", cfg.Boot.Root.Diff, "", "overlay", func(string, ...any) {}, cache, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestRestoreEncryptedCheckpointWithoutManifestConfig(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := preflightRestoreDiskGraph(ctx, cfg, opts, source.RelativeDir, key); err != nil {
+				if err := preflightRestoreDiskGraph(ctx, cfg, opts, source.RelativeDir, key, nil, nil); err != nil {
 					t.Fatal(err)
 				}
 			} else {

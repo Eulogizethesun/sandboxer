@@ -112,7 +112,7 @@ func TestPreflightRestoreDiskGraphRejectsUnformattedActiveDiff(t *testing.T) {
 	err = preflightRestoreDiskGraph(context.Background(), cfg, Options{
 		SandboxID: "restore-preflight",
 		BaseRoot:  filepath.Join(dir, "base"),
-	}, dir, [32]byte{})
+	}, dir, [32]byte{}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "formatted ext4") {
 		t.Fatalf("restore active diff preflight error = %v", err)
 	}
