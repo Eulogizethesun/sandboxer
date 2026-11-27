@@ -98,19 +98,32 @@ type parsedArchive struct {
 // Open parses a Sandbox fail-closed. Every format and config error is returned
 // before the caller can hand Payload to a block backend.
 func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
+	return OpenTrust(ctx, stream, false)
+}
+
+// OpenTrust parses a Sandbox fail-closed with an optional trust declaration.
+// trust=true skips exactly two re-verification passes that a same-library
+// prepare pass already performed on this exact immutable artifact: the
+// canonical re-encoding equality of the runtime config and the EROFS payload
+// size cross-check. Parsing (readMetadata) is never skipped, every file open
+// stays in place, and both re-verified properties still fail closed later — a
+// non-canonical config re-encodes to the same document, and a payload size
+// mismatch surfaces when the EROFS superblock or block reader opens during
+// preflight, still ahead of any VM side effect.
+func OpenTrust(ctx context.Context, stream fetch.Stream, trust bool) (*Root, error) {
 	if stream == nil {
 		return nil, errors.New("sandbox: nil logical stream")
 	}
 	fail := func(err error) (*Root, error) {
 		return nil, errors.Join(err, stream.Close())
 	}
-	archive, portable, checkpoint, err := readMetadata(ctx, stream)
+	archive, portable, checkpoint, err := readMetadata(ctx, stream, trust)
 	if err != nil {
 		return fail(err)
 	}
 	runtimeBytes := archive.bodies[config.SandboxRuntimeConfigName]
 	imageConfig, hasImage := archive.bodies[ImageConfigName]
-	if hasImage {
+	if hasImage && !trust {
 		erofsSize, err := image.ReadEROFSSize(&streamReaderAt{ctx: ctx, stream: stream})
 		if err != nil {
 			return fail(fmt.Errorf("sandbox EROFS payload: %w", err))
@@ -140,11 +153,11 @@ func ReadDiskTable(ctx context.Context, stream fetch.Stream) (*config.PortableSa
 	if stream == nil {
 		return nil, nil, errors.New("sandbox: nil logical stream")
 	}
-	_, cfg, cp, err := readMetadata(ctx, stream)
+	_, cfg, cp, err := readMetadata(ctx, stream, false)
 	return cfg, cp, err
 }
 
-func readMetadata(ctx context.Context, stream fetch.Stream) (*parsedArchive, *config.PortableSandboxConfig, *Checkpoint, error) {
+func readMetadata(ctx context.Context, stream fetch.Stream, trust bool) (*parsedArchive, *config.PortableSandboxConfig, *Checkpoint, error) {
 	archive, err := parseStrictArchive(ctx, stream)
 	if err != nil {
 		return nil, nil, nil, err
@@ -159,12 +172,14 @@ func readMetadata(ctx context.Context, stream fetch.Stream) (*parsedArchive, *co
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("sandbox %s: %w", config.SandboxRuntimeConfigName, err)
 	}
-	canonical, err := config.MarshalPortableSandboxConfig(portable)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if !bytes.Equal(canonical, runtimeBytes) {
-		return nil, nil, nil, fmt.Errorf("sandbox %s is not canonically encoded", config.SandboxRuntimeConfigName)
+	if !trust {
+		canonical, err := config.MarshalPortableSandboxConfig(portable)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !bytes.Equal(canonical, runtimeBytes) {
+			return nil, nil, nil, fmt.Errorf("sandbox %s is not canonically encoded", config.SandboxRuntimeConfigName)
+		}
 	}
 	var checkpoint *Checkpoint
 	if hasCheckpoint {

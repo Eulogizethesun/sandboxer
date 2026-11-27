@@ -107,6 +107,15 @@ type Options struct {
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness sandbox.ReadinessNotify
 
+	// TrustPrepare declares that a same-library prepare pass on this node
+	// already validated the exact immutable S/E artifacts, so restore skips
+	// only re-verification: the snapshot.cfg canonical re-encoding equality
+	// and the Sandbox E canonical re-encoding + EROFS payload size
+	// cross-check (sandboxfile.OpenTrust). Parsing and every file open stay
+	// in place; re-verified properties still fail closed later, ahead of any
+	// VM side effect. Default false — the historical behavior.
+	TrustPrepare bool
+
 	checkpointReleaseSources func() error // temporary source pins; writers own the handoff
 }
 
@@ -136,6 +145,9 @@ func (opts Options) openFile(ctx context.Context, path string, ref manifest.Ref)
 func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	p := perfmark.Start("runtime", "resume").SID(opts.SandboxID)
 	p.Mark("restore.begin")
+	if opts.TrustPrepare {
+		p.Mark("restore.trust_prepare")
+	}
 	if opts.SnapshotPath == "" && opts.SnapshotManifestKey == "" {
 		return -1, errors.New("restore: SnapshotPath or SnapshotManifestKey required")
 	}
@@ -207,16 +219,19 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, fmt.Errorf("open Snapshot S: %w", err)
 	}
 	defer snapshotRoot.Close()
+	p.Mark("restore.meta_s_zip")
 	memoryConfig, err := snapshot.ParseConfig(snapshotRoot.SnapshotConfig)
 	if err != nil {
 		return -1, fmt.Errorf("unsupported snapshot format/version: %w", err)
 	}
-	canonicalSnapshotConfig, err := snapshot.MarshalConfig(memoryConfig)
-	if err != nil {
-		return -1, err
-	}
-	if string(canonicalSnapshotConfig) != string(snapshotRoot.SnapshotConfig) {
-		return -1, errors.New("snapshot.cfg is not canonically encoded")
+	if !opts.TrustPrepare {
+		canonicalSnapshotConfig, err := snapshot.MarshalConfig(memoryConfig)
+		if err != nil {
+			return -1, err
+		}
+		if string(canonicalSnapshotConfig) != string(snapshotRoot.SnapshotConfig) {
+			return -1, errors.New("snapshot.cfg is not canonically encoded")
+		}
 	}
 	p.Mark("restore.meta_s")
 
@@ -225,6 +240,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, fmt.Errorf("open snapshot.cfg sandbox_ref: %w", err)
 	}
 	defer sandboxSource.Root.Close()
+	p.Mark("restore.meta_e_open")
 	opts = sandboxSource.opts
 	opts, sandboxSource, releaseCheckpoint, err := prepareRestoreCheckpoint(ctx, opts, sandboxSource)
 	if err != nil {
@@ -1461,7 +1477,7 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 	default:
 		return nil, fmt.Errorf("unsupported Sandbox source scheme %q", ref.Scheme)
 	}
-	root, err := sandboxfile.Open(ctx, stream)
+	root, err := sandboxfile.OpenTrust(ctx, stream, opts.TrustPrepare)
 	if err != nil {
 		return nil, err
 	}
