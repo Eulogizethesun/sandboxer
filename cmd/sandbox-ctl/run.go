@@ -68,6 +68,13 @@ func runCmd(args []string) int {
 
 	fromRef := fs.String("from", "", "Sandbox artifact reference — cold-start its portable workload and root payload")
 	restoreRef := fs.String("restore", "", "Snapshot reference — restore memory and VMM execution state")
+	// --trust-prepare is a node-local trust declaration set by node-ctl when
+	// the artifact prepare pass already validated the exact immutable
+	// artifacts with the same library: restore skips only the canonical
+	// re-encoding equalities and the EROFS payload size cross-check —
+	// parsing and every file open stay in place, and re-verified properties
+	// still fail closed ahead of any VM side effect.
+	trustPrepare := fs.Bool("trust-prepare", false, "trust the node-local prepare pass (node-ctl sets this; no effect without --restore)")
 	replaceBoot := fs.Bool("replace-boot", false, "with --from, replace the complete boot definition from host config")
 
 	// stdio flags. The bool flags (--stdin/--stdout/--stderr/--tty) are
@@ -383,7 +390,8 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, *memoryCacheDir, *memoryCacheMaxBytes, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, *memoryCacheDir, *memoryCacheMaxBytes, diagnostics,
+			*trustPrepare, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
 	}
 
 	var sourceLaunch sandbox.LaunchSpec
@@ -454,7 +462,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify, memoryCacheDir string, memoryCacheMaxBytes int64, diagnostics io.Writer, checkpointOptions ...runRetentionOptions,
+	notifyReadiness sandbox.ReadinessNotify, memoryCacheDir string, memoryCacheMaxBytes int64, diagnostics io.Writer, trustPrepare bool, checkpointOptions ...runRetentionOptions,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -528,6 +536,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		PingFatalThreshold:  pingFatal,
 		Forwards:            forwards,
 		NotifyReadiness:     notifyReadiness,
+		TrustPrepare:        trustPrepare,
 	})
 	if err != nil {
 		fmt.Fprintln(diagnostics, err)

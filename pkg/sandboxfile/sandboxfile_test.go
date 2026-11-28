@@ -485,6 +485,59 @@ func TestSandboxStrictZIPRejectsUnknownDuplicateExtraAndNonCanonicalConfig(t *te
 	}
 }
 
+// TestOpenTrustSkipsReVerificationOnly pins the trust contract: trust=false
+// fails closed on both re-verification passes; trust=true accepts the exact
+// same inputs and still yields the semantically identical parsed config.
+func TestOpenTrustSkipsReVerificationOnly(t *testing.T) {
+	payload := []byte("payload")
+	nonCanonical := bytes.Replace(livePortableBytes(t), []byte("version: 1\n"), []byte("version: !!int 1\n"), 1)
+	input := append(append([]byte(nil), payload...), rawZIP(t, []rawEntry{
+		{name: config.SandboxRuntimeConfigName, body: nonCanonical},
+	})...)
+	_, err := Open(context.Background(), &closeStream{Source: dataSource(t, input)})
+	if err == nil || !stringsContains(err.Error(), "not canonically encoded") {
+		t.Fatalf("Open error = %v, want %q", err, "not canonically encoded")
+	}
+	root, err := OpenTrust(context.Background(), &closeStream{Source: dataSource(t, input)}, true)
+	if err != nil {
+		t.Fatalf("OpenTrust(trust) error = %v, want the non-canonical config accepted", err)
+	}
+	defer root.Close()
+	canonical, err := config.MarshalPortableSandboxConfig(root.Portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(canonical, livePortableBytes(t)) {
+		t.Fatal("OpenTrust(trust) parsed a semantically different config")
+	}
+}
+
+// TestOpenTrustSkipsEROFSSizeCrossCheck proves the size cross-check is the
+// only EROFS guard behind the trust declaration: a payload whose length
+// disagrees with its own superblock fails under Open and passes under
+// OpenTrust(trust) — the mismatch still surfaces when the block reader opens.
+func TestOpenTrustSkipsEROFSSizeCrossCheck(t *testing.T) {
+	// rawZIP bypasses BuildSource's own build-time size validation, so the
+	// disagreement (payload 4196 vs superblock 4096) reaches the parser.
+	payload := append(append([]byte(nil), fakeEROFS()...), make([]byte, 100)...)
+	imageConfig := []byte(`{"Architecture":"amd64","Os":"linux","Env":["B=2","A=1"]}`)
+	input := append(append([]byte(nil), payload...), rawZIP(t, []rawEntry{
+		{name: ImageConfigName, body: imageConfig},
+		{name: config.SandboxRuntimeConfigName, body: erofsPortableBytes(t)},
+	})...)
+	_, err := Open(context.Background(), &closeStream{Source: dataSource(t, input)})
+	if err == nil || !stringsContains(err.Error(), "does not equal") {
+		t.Fatalf("Open error = %v, want EROFS size mismatch", err)
+	}
+	root, err := OpenTrust(context.Background(), &closeStream{Source: dataSource(t, input)}, true)
+	if err != nil {
+		t.Fatalf("OpenTrust(trust) error = %v, want the size cross-check skipped", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPayloadSectionPreservesHoleZeroDataKinds(t *testing.T) {
 	payload := &kindSource{size: 12, data: []byte("DATA" + "\x00\x00\x00\x00" + "\x00\x00\x00\x00")}
 	logical, err := BuildSource(payload, nil, livePortableBytes(t))
