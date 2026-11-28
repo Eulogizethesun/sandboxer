@@ -85,6 +85,15 @@ type Options struct {
 	StatsInterval       time.Duration // if > 0, periodically log lazy-load stats; 0 = off
 	StdioMode           stdio.Mode    // CH process stdio wiring; see pkg/stdio
 
+	// MemoryCacheDir, when non-empty, materializes immutable manifest:// memory
+	// layers into local raw sparse files and serves restore faults from them.
+	// The cache contains decrypted guest memory: use a tmpfs or protected
+	// storage, and treat entries as disposable (the artifact remains the source
+	// of truth). Empty disables the cache.
+	MemoryCacheDir string
+	// MemoryCacheMaxBytes is a soft cap for the cache; 0 means unlimited.
+	MemoryCacheMaxBytes int64
+
 	// PingFatalThreshold: same semantics as sandbox.RunOptions —
 	// SIGTERM CH after N consecutive ping failures. 0 disables.
 	PingFatalThreshold int
@@ -591,6 +600,31 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	memLayers := make([]fetch.Stream, 1, 1+len(parentMemoryLayers))
 	memLayers[0] = selfStream
 	memLayers = append(memLayers, parentMemoryLayers...)
+	var cachedStreams []fetch.Stream
+	if opts.MemoryCacheDir != "" {
+		// Cache only immutable manifest-backed layers; a file:// checkpoint is
+		// already a direct local read and duplicating it would add I/O.
+		cache := newMemoryCache(opts.MemoryCacheDir, opts.MemoryCacheMaxBytes, logf)
+		refs := make([]string, 0, 1+len(memoryConfig.FromRefs))
+		refs = append(refs, selfRef)
+		refs = append(refs, memoryConfig.FromRefs...)
+		for i := range memLayers {
+			if i >= len(refs) {
+				break
+			}
+			wrapped, cached := cache.wrap(ctx, p, refs[i], memLayers[i])
+			if !cached {
+				continue
+			}
+			memLayers[i] = wrapped
+			cachedStreams = append(cachedStreams, wrapped)
+		}
+		defer func() {
+			for _, stream := range cachedStreams {
+				_ = stream.Close()
+			}
+		}()
+	}
 	source, err := uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot source: %w", err)
