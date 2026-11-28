@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -56,6 +57,8 @@ func runCmd(args []string) int {
 	chBinary := fs.String("ch-binary", "", "path to cloud-hypervisor binary (default: SANDBOX_CH_PATH env, exe-dir, or PATH)")
 	runRoot := fs.String("run-root", "", "tmpfs run root: sockets + snap staging (overrides SANDBOX_RUN_ROOT env; default /run/sandbox)")
 	baseRoot := fs.String("base-root", "", "on-disk base root: overlay diff (overrides SANDBOX_BASE_ROOT env; default /var/lib/sandbox)")
+	memoryCacheDir := fs.String("memory-cache-dir", "", "materialize immutable manifest memory layers into this local directory (overrides SANDBOX_MEMORY_CACHE_DIR; empty disables)")
+	memoryCacheMaxBytes := fs.Int64("memory-cache-max-bytes", 0, "soft byte cap for the memory cache; 0 = unlimited (overrides SANDBOX_MEMORY_CACHE_MAX_BYTES)")
 	refLocations := config.RefLocations{}
 	fs.Var(refLocations, "ref-location", "trusted ref location name=file:///absolute/path (repeatable)")
 
@@ -133,6 +136,27 @@ func runCmd(args []string) int {
 	}
 	if *configPath == "" {
 		*configPath = os.Getenv("SANDBOX_CONFIG")
+	}
+	if *memoryCacheDir == "" {
+		*memoryCacheDir = os.Getenv("SANDBOX_MEMORY_CACHE_DIR")
+	}
+	if *memoryCacheDir != "" && !filepath.IsAbs(*memoryCacheDir) {
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: --memory-cache-dir must be an absolute path")
+		return 2
+	}
+	if *memoryCacheMaxBytes == 0 {
+		if raw := os.Getenv("SANDBOX_MEMORY_CACHE_MAX_BYTES"); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value < 0 {
+				fmt.Fprintln(diagnostics, "sandbox-ctl run: SANDBOX_MEMORY_CACHE_MAX_BYTES must be a non-negative integer")
+				return 2
+			}
+			*memoryCacheMaxBytes = value
+		}
+	}
+	if *memoryCacheMaxBytes < 0 {
+		fmt.Fprintln(diagnostics, "sandbox-ctl run: --memory-cache-max-bytes must be non-negative")
+		return 2
 	}
 	if *replaceBoot && *configPath == "" {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --replace-boot requires --config or SANDBOX_CONFIG")
@@ -359,7 +383,7 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, *memoryCacheDir, *memoryCacheMaxBytes, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
 	}
 
 	var sourceLaunch sandbox.LaunchSpec
@@ -430,7 +454,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify, diagnostics io.Writer, checkpointOptions ...runRetentionOptions,
+	notifyReadiness sandbox.ReadinessNotify, memoryCacheDir string, memoryCacheMaxBytes int64, diagnostics io.Writer, checkpointOptions ...runRetentionOptions,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -496,6 +520,8 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		CHBinary:            chBin,
 		RuntimeRoot:         runDir,
 		BaseRoot:            baseRoot,
+		MemoryCacheDir:      memoryCacheDir,
+		MemoryCacheMaxBytes: memoryCacheMaxBytes,
 		StatsJSONPath:       statsJSON,
 		StatsInterval:       statsInterval,
 		StdioMode:           stdioMode,

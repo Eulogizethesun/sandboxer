@@ -96,6 +96,39 @@ The shared [source read recovery policy](runtime.md#read-recovery) retains the o
 
 `restore.prefetch: memory` is a host-only optimization. It warms the current S self's file page cache or Manifest chunks, excluding parent memory layers and disk streams. The call receives the opened root stream, so its scope may also include S's bounded ZIP metadata tail; it is not a memory-payload-only section. It changes neither sparse truth, fault ordering, C0, S, nor memory parents. The default is `off`. An invalid configured mode fails validation before side effects; lack of prefetch capability or a prefetch I/O failure is best-effort and does not fail restore. It is logged and restore continues on demand. The asynchronous task is canceled and joined before its streams close. See [prefetch.go](../pkg/restore/prefetch.go) and its call in [restore.go](../pkg/restore/restore.go).
 
+<a id="layer-cache"></a>
+
+## Local layer materialization cache
+
+`--memory-cache-dir` (or `SANDBOX_MEMORY_CACHE_DIR`) materializes immutable
+`manifest://` memory layers into local raw sparse files and serves restore faults
+from them. It is a read-through cache of decrypted guest memory: entries are keyed
+by `(ref, size)`, are never authoritative, and may be deleted at any time.
+
+- **Scope**: only `manifest://` memory layers. A `file://` checkpoint layer is
+  already a direct local read; duplicating it into the cache would only add I/O.
+  Disk layers are not involved.
+- **Sparse semantics**: only Data runs are written. Hole/Zero runs live in a
+  `<key>.runs` sidecar so `RunAt` returns the original kinds and the raw file stays
+  sparse (logical size = VM capacity, allocated blocks = Data bytes only).
+- **First use** per layer materializes synchronously: it reads every Data run
+  through the normal store + AES path and writes the raw file. Later restores
+  `pread` the local file.
+- **Quota**: `--memory-cache-max-bytes` (or `SANDBOX_MEMORY_CACHE_MAX_BYTES`) is a
+  soft cap; the oldest entries are evicted. A single layer larger than the cap is
+  kept so a usable template always fits.
+- **Path**: must be absolute; files are created `0600`, the directory `0700`.
+- **Security**: the cache contains decrypted tenant memory. Use a tmpfs or a
+  protected/encrypted volume; with swap enabled, tmpfs pages may still reach swap.
+- **Metrics**: `restore.memory_cache.hit`, `.materialize`, `.evict`, `.error`, and
+  `restore.memory_cache.materialize_ms`.
+- **Cold cost**: the first restore of a template pays materialization (≈100 MB
+  Data / ≈278 ms for the 2C2G template). A one-shot template is a net loss; prefer
+  materializing at template import or on second use.
+- **Integrity**: entries are content-addressed and treated as disposable. A
+  missing/corrupt sidecar or size mismatch is a miss and re-materializes; the raw
+  payload is not checksummed on every hit in this version.
+
 <a id="checkpoint-changes"></a>
 
 ## Checkpoint changes, released pages and history merging
