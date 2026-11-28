@@ -1472,8 +1472,10 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 // restoreDiskCache carries the readers opened by the preflight into the disk
 // reconstruction so each artifact is opened once instead of two or three
 // times. Entries are transferred out (take*) as their owner claims them; any
-// leftovers are closed by Close.
+// leftovers are closed by Close. Parallel preflight workers insert under the
+// mutex: the first handle for a ref wins and duplicate inserts are closed.
 type restoreDiskCache struct {
+	mu      sync.Mutex
 	streams map[string]fetch.Stream
 	bases   map[string]diffstore.BlockReader
 	erofs   map[string]diffstore.BlockReader
@@ -1488,45 +1490,74 @@ func newRestoreDiskCache() *restoreDiskCache {
 }
 
 func (c *restoreDiskCache) putStream(ref string, stream fetch.Stream) {
-	if c != nil && stream != nil {
-		c.streams[ref] = stream
+	if c == nil || stream == nil {
+		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.streams[ref]; ok {
+		// Parallel workers raced on the same ref: the cached handle wins and
+		// the duplicate is closed instead of leaking.
+		_ = stream.Close()
+		return
+	}
+	c.streams[ref] = stream
 }
 
 func (c *restoreDiskCache) takeStream(ref string) fetch.Stream {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	stream := c.streams[ref]
 	delete(c.streams, ref)
 	return stream
 }
 
 func (c *restoreDiskCache) putBase(diskKey string, reader diffstore.BlockReader) {
-	if c != nil && reader != nil {
-		c.bases[diskKey] = reader
+	if c == nil || reader == nil {
+		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.bases[diskKey]; ok {
+		_ = reader.Close()
+		return
+	}
+	c.bases[diskKey] = reader
 }
 
 func (c *restoreDiskCache) takeBase(diskKey string) diffstore.BlockReader {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	reader := c.bases[diskKey]
 	delete(c.bases, diskKey)
 	return reader
 }
 
 func (c *restoreDiskCache) putEROFS(ref string, reader diffstore.BlockReader) {
-	if c != nil && reader != nil {
-		c.erofs[ref] = reader
+	if c == nil || reader == nil {
+		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.erofs[ref]; ok {
+		_ = reader.Close()
+		return
+	}
+	c.erofs[ref] = reader
 }
 
 func (c *restoreDiskCache) takeEROFS(ref string) diffstore.BlockReader {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	reader := c.erofs[ref]
 	delete(c.erofs, ref)
 	return reader
@@ -1536,6 +1567,8 @@ func (c *restoreDiskCache) Close() error {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var err error
 	for ref, stream := range c.streams {
 		err = errors.Join(err, stream.Close())
@@ -1559,22 +1592,37 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 	opts.ArtifactRelativeDir = relativeDir
 	seen := make(map[string]uint64)
 	seenImages := make(map[string]uint64)
+	// Per-disk preflight runs on bounded parallel workers; the seen map
+	// serializes bookkeeping while the artifact opens happen outside the lock.
+	var seenMu sync.Mutex
 	open := func(field, raw string) (uint64, error) {
 		if raw == "" {
 			return 0, fmt.Errorf("%s is empty", field)
 		}
-		if size, ok := seen[raw]; ok {
+		seenMu.Lock()
+		size, ok := seen[raw]
+		seenMu.Unlock()
+		if ok {
 			return size, nil
 		}
 		stream, err := openDiskRefStream(ctx, raw, opts)
 		if err != nil {
 			return 0, fmt.Errorf("%s: %w", field, err)
 		}
-		size := stream.Size()
+		seenMu.Lock()
+		if cached, ok := seen[raw]; ok {
+			seenMu.Unlock()
+			// A sibling disk opened the same ref first: keep its handle and
+			// close ours so the ref is opened once across all workers.
+			_ = stream.Close()
+			return cached, nil
+		}
+		size = stream.Size()
+		seen[raw] = size
+		seenMu.Unlock()
 		// Keep the handle for the later layered/COW open instead of reopening
 		// the same artifact; the cache owner closes it if it goes unused.
 		cache.putStream(raw, stream)
-		seen[raw] = size
 		return size, nil
 	}
 	// The read-only EROFS base is independent of the writable diff and its
@@ -1605,14 +1653,18 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		if raw == "" {
 			return nil, fmt.Errorf("%s is empty", field)
 		}
+		seenMu.Lock()
 		if _, ok := seenImages[raw]; ok {
+			seenMu.Unlock()
 			return nil, nil
 		}
 		if fut, ok := futures[raw]; ok {
+			seenMu.Unlock()
 			return fut, nil
 		}
 		fut := &imageFuture{raw: raw, done: make(chan struct{})}
 		futures[raw] = fut
+		seenMu.Unlock()
 		go func() {
 			t := time.Now()
 			fut.res.reader, fut.res.size, fut.res.err = openEROFSBlockReader(ctx, raw, opts)
@@ -1629,7 +1681,9 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		if fut.res.err != nil {
 			return fmt.Errorf("%s: %w", field, fut.res.err)
 		}
+		seenMu.Lock()
 		if fut.registered {
+			seenMu.Unlock()
 			return nil
 		}
 		fut.registered = true
@@ -1637,6 +1691,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		// hand it the already-open reader instead of reopening.
 		cache.putEROFS(fut.raw, fut.res.reader)
 		seenImages[fut.raw] = uint64(fut.res.size)
+		seenMu.Unlock()
 		return nil
 	}
 	checkLayers := func(field, top string, lowers []string) error {
@@ -1789,36 +1844,68 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		p.Dur("restore.pf.layers", tLayers)
 		return fut, err
 	}
-	rootFuture, err := checkRoot("boot.root", &cfg.Boot.Root)
-	if err != nil {
-		return err
+	// Disks (boot.root included) are independent preflight jobs; run them on
+	// bounded parallel workers so a wide disk graph cannot stampede the
+	// artifact store. All jobs run to completion and the first recorded error
+	// is returned; within one job the serial ordering checkRoot ->
+	// validateWritable -> joinImage is preserved.
+	type preflightDiskJob struct {
+		field     string
+		root      *config.RootConfig
+		diskKey   string
+		pure      bool
+		joinField string
 	}
-	if err := validateWritable("boot.root", &cfg.Boot.Root, "overlay", false); err != nil {
-		return err
-	}
-	if err := joinImage("boot.root.base", rootFuture); err != nil {
-		return err
-	}
+	jobs := []preflightDiskJob{{field: "boot.root", root: &cfg.Boot.Root, diskKey: "overlay", joinField: "boot.root.base"}}
 	for i := range cfg.Boot.Disks {
 		disk := &cfg.Boot.Disks[i]
 		if disk.Unbound() {
 			continue
 		}
+		jobs = append(jobs, preflightDiskJob{
+			field:     fmt.Sprintf("boot.disks[%d]", i),
+			root:      &disk.RootConfig,
+			diskKey:   fmt.Sprintf("disk%d", i),
+			pure:      disk.PureBlock,
+			joinField: fmt.Sprintf("boot.disks[%d]", i),
+		})
+	}
+	preflightDisk := func(job preflightDiskJob) error {
 		var diskFuture *imageFuture
-		if !disk.PureBlock {
-			diskFuture, err = checkRoot(fmt.Sprintf("boot.disks[%d]", i), &disk.RootConfig)
+		if !job.pure {
+			var err error
+			diskFuture, err = checkRoot(job.field, job.root)
 			if err != nil {
 				return err
 			}
 		}
-		if err := validateWritable(fmt.Sprintf("boot.disks[%d]", i), &cfg.Boot.Disks[i].RootConfig, fmt.Sprintf("disk%d", i), disk.PureBlock); err != nil {
+		if err := validateWritable(job.field, job.root, job.diskKey, job.pure); err != nil {
 			return err
 		}
-		if err := joinImage(fmt.Sprintf("boot.disks[%d]", i), diskFuture); err != nil {
-			return err
-		}
+		return joinImage(job.joinField, diskFuture)
 	}
-	return nil
+	const preflightMaxWorkers = 4
+	var workers sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	sem := make(chan struct{}, min(preflightMaxWorkers, len(jobs)))
+	for _, job := range jobs {
+		workers.Add(1)
+		sem <- struct{}{}
+		go func(job preflightDiskJob) {
+			defer workers.Done()
+			defer func() { <-sem }()
+			if err := preflightDisk(job); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		}(job)
+	}
+	workers.Wait()
+	return firstErr
 }
 
 func validateRestoreExt4Reader(ctx context.Context, reader diffstore.BlockReader) error {
